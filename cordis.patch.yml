@@ -1,0 +1,6 @@
+- insert:
+    - id: hongguo
+      name: dsh-hongguo
+      config:
+        autoPrompt: true
+        panelWidth: 480

@@ -1,0 +1,44 @@
+{
+  "name": "dsh-hongguo",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "播放红果短剧：右侧边栏短剧播放器，等待 Agent 时提示调出（基于 openhongguo）",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./vendor/*": "./vendor/*"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "vendor/",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "bundleDependencies": [
+    "openhongguo"
+  ],
+  "dependencies": {
+    "openhongguo": "0.1.0"
+  }
+}
