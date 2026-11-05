@@ -190,7 +190,7 @@ window.__ModuleLoader__.load({
 .hg-feature-head{font-size:11px;color:var(--dsw-alias-label-secondary);margin:0 0 6px;}
 .hg-feature-card{display:flex;gap:12px;width:100%;text-align:left;appearance:none;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);padding:10px;color:inherit;font:inherit;cursor:pointer;}
 .hg-feature-card:hover{border-color:var(--dsw-alias-brand-primary);}
-.hg-feature-cover{flex:none;width:84px;aspect-ratio:3/4;border-radius:8px;overflow:hidden;background:var(--dsw-alias-bg-layer-2);display:flex;align-items:center;justify-content:center;}
+.hg-feature-cover{position:relative;flex:none;width:84px;aspect-ratio:3/4;border-radius:8px;overflow:hidden;background:var(--dsw-alias-bg-layer-2);display:flex;align-items:center;justify-content:center;}
 .hg-feature-cover img{width:100%;height:100%;object-fit:cover;}
 .hg-feature-copy{display:flex;flex-direction:column;gap:6px;min-width:0;}
 .hg-feature-copy b{font-size:14px;line-height:1.35;}
