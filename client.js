@@ -72,6 +72,11 @@ window.__ModuleLoader__.load({
       'player.watchNow': '现在就看',
       'player.drm': '这一集是加密流，且未能在本机解密（需要安装 ffmpeg）',
       'player.error': '出错了：{message}',
+      'source.switch': '切换片源（红果 / 黄果）',
+      'source.hongguo': '红果',
+      'source.huangguo': '黄果',
+      'source.payRequired': '这一集需要购买或会员才能播放',
+      'player.noFree': '这部剧没有可免费播放的集',
     }
     const en = {
       'tab.title': 'Drama Break',
@@ -124,6 +129,11 @@ window.__ModuleLoader__.load({
       'player.fullscreen': 'Fullscreen',
       'player.play': 'Play',
       'player.pause': 'Pause',
+      'source.switch': 'Switch source (Hongguo / Huangguo)',
+      'source.hongguo': 'Hongguo',
+      'source.huangguo': 'Huangguo',
+      'source.payRequired': 'This episode needs a purchase or membership',
+      'player.noFree': 'No free episodes in this drama',
       'player.watchNow': 'Watch now',
       'player.drm': 'This episode is encrypted and could not be decrypted locally (ffmpeg is required)',
       'player.error': 'Something went wrong: {message}',
@@ -132,6 +142,8 @@ window.__ModuleLoader__.load({
     const CSS = `
 .hg-root{display:flex;flex-direction:column;height:100%;min-height:0;color:var(--dsw-alias-label-primary);font-size:13px;}
 .hg-head{display:flex;align-items:center;gap:8px;padding:10px 12px 8px;flex:none;}
+.hg-source{appearance:none;border:0;background:none;padding:0;cursor:default;display:flex;align-items:center;border-radius:8px;}
+.hg-source:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px;}
 .hg-title{font-weight:600;font-size:14px;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .hg-btn{appearance:none;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);border-radius:8px;font:inherit;font-size:12px;line-height:1;padding:7px 10px;cursor:pointer;white-space:nowrap;}
 .hg-btn:hover{background:var(--dsw-alias-bg-layer-2);}
@@ -302,13 +314,14 @@ window.__ModuleLoader__.load({
       )
     }
 
-    function Mark({ size = 16 }) {
+    function Mark({ size = 16, tone = 'red' }) {
+      const yellow = tone === 'yellow'
       return h(
         'svg',
         { width: size, height: size, viewBox: '0 0 64 64', 'aria-hidden': true, style: { flex: 'none', display: 'block' } },
-        h('rect', { x: 4, y: 6, width: 36, height: 52, rx: 10, fill: '#e0323f' }),
+        h('rect', { x: 4, y: 6, width: 36, height: 52, rx: 10, fill: yellow ? '#f0b90b' : '#e0323f' }),
         h('circle', { cx: 44, cy: 42, r: 16, fill: '#fff' }),
-        h('path', { d: 'M40 34.5v15a1.6 1.6 0 0 0 2.45 1.36l11.6-7.5a1.6 1.6 0 0 0 0-2.72l-11.6-7.5A1.6 1.6 0 0 0 40 34.5Z', fill: '#c61d4b' }),
+        h('path', { d: 'M40 34.5v15a1.6 1.6 0 0 0 2.45 1.36l11.6-7.5a1.6 1.6 0 0 0 0-2.72l-11.6-7.5A1.6 1.6 0 0 0 40 34.5Z', fill: yellow ? '#d99a06' : '#c61d4b' }),
         h('path', { d: 'M12 33h12', stroke: '#fff', strokeOpacity: 0.5, strokeWidth: 3, strokeLinecap: 'round' }),
       )
     }
@@ -320,7 +333,7 @@ window.__ModuleLoader__.load({
      * gate, so the DSH shell's CSP does not need a blob: source.
      */
     const vendorLoads = new Map()
-    function loadVendor(file) {
+    function loadVendor(file, globalName = 'mpegts') {
       if (vendorLoads.has(file)) return vendorLoads.get(file)
       const loading = new Promise((resolve, reject) => {
         if (file.endsWith('.mjs')) {
@@ -330,9 +343,25 @@ window.__ModuleLoader__.load({
         }
         const script = document.createElement('script')
         script.src = `${API}/vendor/${file}`
+        // UMD bundles register with an AMD loader instead of a global when the
+        // page has one; hide it for this script so the global is always set.
+        const amd = typeof window.define === 'function' && window.define.amd ? window.define : undefined
+        if (amd) window.define = undefined
+        const restore = () => {
+          if (amd) window.define = amd
+        }
         // Classic scripts are executed whatever MIME type the shell serves.
-        script.onload = () => resolve(window.mpegts)
-        script.onerror = () => reject(new Error(`failed to load ${file}`))
+        script.onload = () => {
+          restore()
+          const value = window[globalName]
+          if (value) resolve(value)
+          else reject(new Error(`${file} did not define ${globalName}`))
+        }
+        script.onerror = () => {
+          restore()
+          vendorLoads.delete(file)
+          reject(new Error(`failed to load ${file}`))
+        }
         document.head.append(script)
       })
       vendorLoads.set(file, loading)
@@ -356,32 +385,56 @@ window.__ModuleLoader__.load({
       return body
     }
 
-    /** Last drama list, so the door prompt can name one without a round trip. */
-    let feedCache = { at: 0, items: [] }
+    /**
+     * 片源：hongguo = 红果（openhongguo SDK），huangguo = 黄果（APK 逆向接口）。
+     * 选择记在 localStorage，刷新后保持；两个片源的列表和观看历史互不影响。
+     */
+    let preferredSource = 'hongguo'
+    try {
+      if (localStorage.getItem('hg.source') === 'huangguo') preferredSource = 'huangguo'
+    } catch {
+      // 隐私模式下读不到 localStorage，用默认片源即可。
+    }
+    function setPreferredSource(source) {
+      preferredSource = source === 'huangguo' ? 'huangguo' : 'hongguo'
+      try {
+        localStorage.setItem('hg.source', preferredSource)
+      } catch {
+        // 存不下来只影响下次启动的默认值。
+      }
+    }
+    function sourceQuery(source = preferredSource) {
+      return `source=${encodeURIComponent(source)}`
+    }
 
-    /** The Host's drama list, cached for a minute. */
+    /** Last drama list, so the door prompt can name one without a round trip. */
+    let feedCache = { at: 0, items: [], source: '' }
+
+    /** The Host's drama list, cached for a minute per source. */
     async function fetchFeed(force) {
-      if (!force && feedCache.items.length > 0 && Date.now() - feedCache.at < 60_000) return feedCache.items
-      const body = await callApi('/feed')
-      feedCache = { at: Date.now(), items: body.items ?? [] }
+      const source = preferredSource
+      if (!force && feedCache.items.length > 0 && feedCache.source === source && Date.now() - feedCache.at < 60_000) return feedCache.items
+      const body = await callApi(`/feed?${sourceQuery(source)}`)
+      feedCache = { at: Date.now(), items: body.items ?? [], source }
       return feedCache.items
     }
 
     /** Episode list for one drama; failures on a rotated device are retried once. */
-    async function fetchSeries(seriesId) {
+    async function fetchSeries(seriesId, source = preferredSource) {
+      const query = `/series?${sourceQuery(source)}&id=${encodeURIComponent(seriesId)}`
       try {
-        const body = await callApi(`/series?id=${encodeURIComponent(seriesId)}`)
+        const body = await callApi(query)
         return (body.episodes ?? []).filter((episode) => episode.playable !== false)
       } catch (error) {
         if (error.code !== 'ANONYMOUS_LIMITED') throw error
-        const body = await callApi(`/series?id=${encodeURIComponent(seriesId)}`)
+        const body = await callApi(query)
         return (body.episodes ?? []).filter((episode) => episode.playable !== false)
       }
     }
 
     /** A play model; a limited anonymous device is rotated by the Host and retried here. */
-    async function fetchPlayback(episodeId, seriesId) {
-      const query = `/play?episode=${encodeURIComponent(episodeId)}${seriesId ? '&series=' + encodeURIComponent(seriesId) : ''}`
+    async function fetchPlayback(episodeId, seriesId, source = preferredSource) {
+      const query = `/play?${sourceQuery(source)}&episode=${encodeURIComponent(episodeId)}${seriesId ? '&series=' + encodeURIComponent(seriesId) : ''}`
       try {
         return await callApi(query)
       } catch (error) {
@@ -403,6 +456,17 @@ window.__ModuleLoader__.load({
     // slot, and a short list of recently watched dramas. They are the only
     // persisted player state; everything else is derived from the Host.
     const HISTORY_KEY = 'dsh-hongguo.watch-history.v1'
+    /** 每个片源一份历史：红果和黄果的“看到第几集”完全隔离。 */
+    function historyKey(source = preferredSource) {
+      return `${HISTORY_KEY}.${source === 'huangguo' ? 'huangguo' : 'hongguo'}`
+    }
+    // 老版本只有一把不带片源后缀的 key；第一次运行时搬到红果名下。
+    try {
+      const legacy = localStorage.getItem(HISTORY_KEY)
+      if (legacy && !localStorage.getItem(historyKey('hongguo'))) localStorage.setItem(historyKey('hongguo'), legacy)
+    } catch {
+      // 读不到存储就不迁移。
+    }
     /** A finished episode restarts from zero instead of resuming near its end. */
     const END_MARGIN = 5
 
@@ -424,8 +488,8 @@ window.__ModuleLoader__.load({
     }
 
     /** Read one session's progress for one drama, or undefined. */
-    function progressOf(seriesId, episodeId) {
-      const history = readJson(HISTORY_KEY, { series: {} })
+    function progressOf(seriesId, episodeId, source = preferredSource) {
+      const history = readJson(historyKey(source), { series: {} })
       const record = history.series?.[seriesId]
       if (!record || record.episodeId !== episodeId) return undefined
       return record.position
@@ -436,11 +500,11 @@ window.__ModuleLoader__.load({
      * drama just opened may have no episode yet; it still belongs in the list,
      * with no episode so the player starts it from the first one.
      */
-    function saveProgress(series, episode, position) {
+    function saveProgress(series, episode, position, source = preferredSource) {
       if (!series?.id) return
       const at = Number.isFinite(position) && position > 0 ? position : 0
       if (at > 0 && !episode?.id) return
-      const history = readJson(HISTORY_KEY, { series: {} })
+      const history = readJson(historyKey(source), { series: {} })
       const records = history.series ?? {}
       records[series.id] = { seriesId: series.id, title: series.title, episodeId: episode?.id, number: episode?.number, position: at, at: Date.now() }
       // Keep the list short: the most recent twelve dramas.
@@ -450,12 +514,12 @@ window.__ModuleLoader__.load({
           .slice(0, 12)
           .map((record) => [record.seriesId, record]),
       )
-      writeJson(HISTORY_KEY, { series: trimmed })
+      writeJson(historyKey(source), { series: trimmed })
     }
 
     /** Recently watched dramas, newest first, straight from storage. */
-    function listHistory() {
-      const stored = readJson(HISTORY_KEY, { series: {} })
+    function listHistory(source = preferredSource) {
+      const stored = readJson(historyKey(source), { series: {} })
       return Object.values(stored.series ?? {}).sort((a, b) => (b.at ?? 0) - (a.at ?? 0))
     }
 
@@ -494,6 +558,8 @@ window.__ModuleLoader__.load({
      */
     function DramaPlayer({ requested, compact }) {
       const t = useTranslate()
+      /** 当前片源：'hongguo' 红果 / 'huangguo' 黄果。切换时列表和历史一起换。 */
+      const [source, setSource] = React.useState(preferredSource)
       const [feed, setFeed] = React.useState({ status: 'loading', items: [], error: undefined })
       const [query, setQuery] = React.useState('')
       const [series, setSeries] = React.useState(undefined)
@@ -516,7 +582,7 @@ window.__ModuleLoader__.load({
       const [retryKey, setRetryKey] = React.useState(0)
       /** Paused because the task finished; the element itself is untouched. */
       const [pausedByFinish, setPausedByFinish] = React.useState(false)
-      const [watched, setWatched] = React.useState(() => listHistory())
+      const [watched, setWatched] = React.useState(() => listHistory(preferredSource))
       const [resumeNotice, setResumeNotice] = React.useState(undefined)
       const videoRef = React.useRef(null)
       // The position this episode should start from, and whether it is a
@@ -526,27 +592,27 @@ window.__ModuleLoader__.load({
 
       const loadFeed = React.useCallback(() => {
         setFeed((previous) => ({ ...previous, status: 'loading', error: undefined }))
-        callApi('/feed')
+        callApi(`/feed?${sourceQuery(source)}`)
           .then((body) => setFeed({ status: 'ready', items: body.items ?? [], error: undefined }))
           .catch((error) => setFeed({ status: 'error', items: [], error }))
-      }, [])
+      }, [source])
 
       React.useEffect(loadFeed, [loadFeed])
 
       // Enter one drama: load its episodes, then continue the episode the
       // history left unfinished (or start the first one).
       const openSeries = React.useCallback((item) => {
-        const known = listHistory().find((row) => row.seriesId === item.id)
-        saveProgress(item, { id: known?.episodeId, number: known?.number }, known ? known.position : 0)
-        setWatched(listHistory())
+        const known = listHistory(source).find((row) => row.seriesId === item.id)
+        saveProgress(item, { id: known?.episodeId, number: known?.number }, known ? known.position : 0, source)
+        setWatched(listHistory(source))
         setSeries(item)
         setCurrent(undefined)
         setPlayback({ status: 'idle', data: undefined, error: undefined })
         setSeriesInfo({ status: 'loading', episodes: [], error: undefined })
-        fetchSeries(item.id)
+        fetchSeries(item.id, source)
           .then((episodes) => {
             setSeriesInfo({ status: 'ready', episodes, error: undefined })
-            const record = listHistory().find((row) => row.seriesId === item.id)
+            const record = listHistory(source).find((row) => row.seriesId === item.id)
             const saved = record ? episodes.find((episode) => episode.id === record.episodeId) : undefined
             const target = saved ?? episodes[0]
             if (!target) return
@@ -555,7 +621,7 @@ window.__ModuleLoader__.load({
             playEpisodeRef.current(target, position)
           })
           .catch((error) => setSeriesInfo({ status: 'error', episodes: [], error }))
-      }, [])
+      }, [source])
 
       const requestedId = typeof requested?.id === 'string' ? requested.id : undefined
       const openSeriesRef = React.useRef(openSeries)
@@ -572,42 +638,59 @@ window.__ModuleLoader__.load({
       // remembered from an earlier viewing.
       const playEpisode = React.useCallback(
         (episode, resumeAt = 0) => {
-          const record = listHistory().find((row) => row.seriesId === series?.id)
+          const record = listHistory(source).find((row) => row.seriesId === series?.id)
           const position = episode.id === record?.episodeId ? Math.max(resumeAt, Number(record.position) || 0) : resumeAt
           resumeRef.current = { position: Math.max(0, Number(position) || 0), resumed: position > 0 }
           lastSavedRef.current = 0
           setCurrent({ id: episode.id, number: episode.number })
           setPlayback({ status: 'loading', data: undefined, error: undefined })
           setProgress({ time: 0, duration: 0 })
-          fetchPlayback(episode.id, series?.id)
+          fetchPlayback(episode.id, series?.id, source)
             .then((data) => {
               setPlayback({ status: 'ready', data, error: undefined })
               setQuality(undefined)
             })
             .catch((error) => setPlayback({ status: 'error', data: undefined, error }))
         },
-        [series],
+        [series, source],
       )
       // Open routes through the current callback without re-creating it.
       /** Forget one drama's history (list row's remove control). */
       const forget = React.useCallback((seriesId) => {
-        const next = Object.fromEntries(listHistory().filter((row) => row.seriesId !== seriesId).map((row) => [row.seriesId, row]))
-        writeJson(HISTORY_KEY, { series: next })
-        setWatched(listHistory())
-      }, [])
+        const next = Object.fromEntries(listHistory(source).filter((row) => row.seriesId !== seriesId).map((row) => [row.seriesId, row]))
+        writeJson(historyKey(source), { series: next })
+        setWatched(listHistory(source))
+      }, [source])
 
       /** Continue exactly where the history left off. */
       const continueWatching = React.useCallback(
         (row) => {
-          fetchSeries(row.seriesId)
+          fetchSeries(row.seriesId, source)
             .then((episodes) => {
               const episode = episodes.find((item) => item.id === row.episodeId) ?? episodes[0]
               if (episode) playEpisode(episode, row.episodeId === episode.id ? row.position : 0)
             })
             .catch(() => {})
         },
-        [playEpisode],
+        [playEpisode, source],
       )
+
+      /** 图标切换片源：红果 ↔ 黄果；列表、分集、历史都跟着换。 */
+      const toggleSource = React.useCallback(() => {
+        const next = source === 'huangguo' ? 'hongguo' : 'huangguo'
+        setPreferredSource(next)
+        setSource(next)
+        setSeries(undefined)
+        setCurrent(undefined)
+        setPlayback({ status: 'idle', data: undefined, error: undefined })
+        setSeriesInfo({ status: 'idle', episodes: [], error: undefined })
+        setShowHistory(false)
+        setQuery('')
+        setPage(0)
+        setChunk(0)
+        setFeed({ status: 'loading', items: [], error: undefined })
+        setWatched(listHistory(next))
+      }, [source])
 
       const playEpisodeRef = React.useRef(playEpisode)
       React.useEffect(() => {
@@ -669,7 +752,19 @@ window.__ModuleLoader__.load({
         if (!video || !activeSource || activeSource.kind === 'file') return undefined
         let player
         let disposed = false
-        const attach = activeSource.kind === 'hls'
+        const attach = activeSource.kind === 'hlsjs'
+          ? loadVendor('hls.light.min.js', 'Hls').then((hlsModule) => {
+              if (disposed) return
+              const Hls = hlsModule?.default ?? hlsModule
+              if (!Hls?.isSupported?.()) throw new Error(t('player.noMse'))
+              player = new Hls({ enableWorker: false, lowLatencyMode: false })
+              player.on(Hls.Events?.ERROR ?? 'hlsError', (event, data) => {
+                if (data?.fatal) failOnMedia()
+              })
+              player.loadSource(activeSource.url)
+              player.attachMedia(video)
+            })
+          : activeSource.kind === 'hls'
           ? loadVendor('mpegts.js').then((mpegts) => {
               if (disposed) return
               const engine = mpegts.default ?? mpegts
@@ -693,12 +788,14 @@ window.__ModuleLoader__.load({
               player.on(player.constructor.events?.ERROR ?? 'error', failOnMedia)
             })
         attach.catch((error) => {
-          if (!disposed) console.error('[hongguo] player failed', error)
+          if (disposed) return
+          console.error('[hongguo] player failed', error)
+          failOnMedia()
         })
         return () => {
           disposed = true
           try {
-            if (activeSource.kind === 'hls') player?.destroy()
+            if (activeSource.kind === 'hls' || activeSource.kind === 'hlsjs') player?.destroy()
             else player?.reset()
           } catch {
             // A half-built player has nothing to release.
@@ -739,7 +836,7 @@ window.__ModuleLoader__.load({
 
       // The list's "recent" section follows the stored history on every episode.
       React.useEffect(() => {
-        if (current) setWatched(listHistory())
+        if (current) setWatched(listHistory(source))
       }, [current])
 
       /**
@@ -820,7 +917,16 @@ window.__ModuleLoader__.load({
         { className: 'hg-head' },
         series
           ? h('button', { className: 'hg-icon-btn', type: 'button', title: t('player.back'), 'aria-label': t('player.back'), onClick: () => { setSeries(undefined); setCurrent(undefined); setPlayback({ status: 'idle' }) } }, h(Icon, { name: 'back' }))
-          : h(Mark, { size: 18 }),
+          : h(
+              'button',
+              {
+                className: 'hg-source',
+                type: 'button',
+                'aria-label': t('source.switch'),
+                onClick: toggleSource,
+              },
+              h(Mark, { size: 18, tone: source === 'huangguo' ? 'yellow' : 'red' }),
+            ),
         h(
           'div',
           { className: 'hg-title-wrap' },
@@ -1010,7 +1116,7 @@ window.__ModuleLoader__.load({
                   // Persist about once per second, not on every tick.
                   if (current && Math.abs(video.currentTime - lastSavedRef.current) >= 1) {
                     lastSavedRef.current = video.currentTime
-                    saveProgress(series, current, video.currentTime)
+                    saveProgress(series, current, video.currentTime, source)
                   }
                 },
                 onLoadedMetadata: (event) => {
@@ -1034,7 +1140,7 @@ window.__ModuleLoader__.load({
                   const video = event.currentTarget
                   // Only a real end of playback advances.
                   if (video.duration && video.currentTime < video.duration - 1) return
-                  if (current) saveProgress(series, current, video.duration ?? 0)
+                  if (current) saveProgress(series, current, video.duration ?? 0, source)
                   if (nextEpisode) playEpisode(nextEpisode)
                 },
                 onError: failOnMedia,
@@ -1179,7 +1285,9 @@ window.__ModuleLoader__.load({
                     h('button', { type: 'button', className: 'hg-idle-pick', onClick: () => pickRandom(seriesInfo.episodes) }, t('player.pickRandom')),
                     h('button', { type: 'button', className: 'hg-btn primary', onClick: () => playEpisode(seriesInfo.episodes[0]) }, t('player.startFirst')),
                   )
-                : null,
+                : seriesInfo.status === 'ready'
+                  ? h('div', { className: 'hg-empty' }, t('player.noFree'))
+                  : null,
           seriesInfo.status === 'error' ? h(ErrorBox, { error: seriesInfo.error, onRetry: () => series && openSeries(series) }) : null,
           series?.description && !current ? h('div', { className: 'hg-desc' }, series.description) : null,
           episodePanel,

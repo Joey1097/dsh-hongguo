@@ -18,6 +18,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
 import { createClient } from 'openhongguo'
+import { Client as HuangguoClient } from './sdk/huangguo/index.js'
 
 export const name = 'dsh-hongguo'
 
@@ -292,7 +293,7 @@ export function apply(ctx, config = {}) {
 
   /** Domains the proxy is allowed to fetch. */
   function allowedHost(hostname) {
-    return /(^|\.)(qznovelvod\.com|byteimg\.com|fqnovelpic\.com|douyinvod\.com|bytecdn\.cn|ibytedtos\.com|snssdk\.com)$/.test(hostname)
+    return /(^|\.)(qznovelvod\.com|byteimg\.com|fqnovelpic\.com|douyinvod\.com|bytecdn\.cn|ibytedtos\.com|snssdk\.com|lkkwip\.cn|6cc2n\.com|uszim\.com|cloudfront\.net)$/.test(hostname)
   }
 
   async function proxyStream(mediaUrl) {
@@ -383,6 +384,21 @@ export function apply(ctx, config = {}) {
    * serves only the composed client module, so these assets get their own
    * prefix route on the same Web server.
    */
+  /** 黄果图片 CDN 会把图片前 100 字节与固定串异或（image_crypto.dart）。 */
+  const IMAGE_XOR_KEY = Buffer.from('2019ysapp7527', 'latin1')
+  function xorImageHead(bytes) {
+    const out = Buffer.from(bytes)
+    for (let i = 0; i < Math.min(100, out.length); i += 1) out[i] ^= IMAGE_XOR_KEY[i % IMAGE_XOR_KEY.length]
+    return out
+  }
+  function sniffImage(bytes) {
+    if (bytes[0] === 0xff && bytes[1] === 0xd8) return 'image/jpeg'
+    if (bytes[0] === 0x89 && bytes[1] === 0x50) return 'image/png'
+    if (bytes.subarray(0, 4).toString('latin1') === 'RIFF' && bytes.subarray(8, 12).toString('latin1') === 'WEBP') return 'image/webp'
+    if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return 'image/gif'
+    return ''
+  }
+
   /**
    * Serve one cover as JPEG. The CDN only publishes HEIC, which Chromium
    * cannot decode; macOS ships `sips` for the conversion, and the result is
@@ -396,20 +412,20 @@ export function apply(ctx, config = {}) {
     } catch {
       target = undefined
     }
-    if (!target || !/^https?:$/.test(target.protocol) || !/(^|\.)(fqnovelpic\.com|byteimg\.com|pstatp\.com|snssdk\.com|bytecdn\.cn)$/.test(target.hostname)) {
+    if (!target || !/^https?:$/.test(target.protocol) || !/(^|\.)(fqnovelpic\.com|byteimg\.com|pstatp\.com|snssdk\.com|bytecdn\.cn|lkkwip\.cn|6cc2n\.com|uszim\.com)$/.test(target.hostname)) {
       response.statusCode = 400
       return response.end()
     }
     const key = createHash('sha1').update(target.href).digest('hex')
     const cached = join(coverDir, `${key}.jpg`)
-    const sendJpeg = (bytes) => {
+    const sendImage = (bytes, mime = 'image/jpeg') => {
       response.statusCode = 200
-      response.setHeader('content-type', 'image/jpeg')
+      response.setHeader('content-type', mime)
       response.setHeader('cache-control', 'public, max-age=86400')
       response.end(request.method === 'HEAD' ? undefined : bytes)
     }
     try {
-      return sendJpeg(await readFile(cached))
+      return sendImage(await readFile(cached))
     } catch {
       // Not converted yet.
     }
@@ -425,8 +441,19 @@ export function apply(ctx, config = {}) {
       return response.end()
     }
     const type = upstream.headers.get('content-type') ?? ''
-    const bytes = Buffer.from(await upstream.arrayBuffer())
-    if (/^image\/(jpeg|png|webp|gif|avif)/.test(type)) return sendJpeg(bytes)
+    let bytes = Buffer.from(await upstream.arrayBuffer())
+    // 黄果的图片 CDN 常把 JPEG 标成 application/octet-stream；先按魔数判断，
+    // 不像图片时再按前 100 字节异或还原一次。
+    let sniffed = sniffImage(bytes)
+    if (!sniffed) {
+      const decoded = xorImageHead(bytes)
+      const decodedType = sniffImage(decoded)
+      if (decodedType) {
+        bytes = decoded
+        sniffed = decodedType
+      }
+    }
+    if (/^image\/(jpeg|png|webp|gif|avif)/.test(type) || sniffed) return sendImage(bytes, sniffed || type)
     // HEIC and everything else local ImageIO understands goes through sips.
     const rawPath = join(coverDir, `${key}.heic`)
     const outPath = `${key}.jpg`
@@ -435,7 +462,7 @@ export function apply(ctx, config = {}) {
       await writeFile(rawPath, bytes)
       await sips(['-s', 'format', 'jpeg', '-s', 'formatOptions', '70', '--resampleWidth', '240', rawPath, '--out', join(coverDir, outPath)])
       const converted = await readFile(cached)
-      return sendJpeg(converted)
+      return sendImage(converted)
     } catch (error) {
       logger.warn?.(`[hongguo] cover conversion failed: ${error?.message ?? error}`)
       response.statusCode = 415
@@ -546,6 +573,72 @@ export function apply(ctx, config = {}) {
       }
     })()
     return refreshing
+  }
+
+  // ---- 黄果短剧（huangguo）--------------------------------------------------
+  // 第二个片源：APK 逆向出的 JSON 接口 + HLS（AES-128）。设备档案单独一份，
+  // 与红果的 openhongguo 档案互不影响。
+  const hgProfilePath = join(dataDir, 'huangguo-profile.json')
+  let hgClientPromise
+  function hgClient() {
+    hgClientPromise ??= (async () => {
+      const sdk = new HuangguoClient({ profile: hgProfilePath, timeoutMs: 25_000 })
+      await sdk.ensureLogin()
+      return sdk
+    })().catch((error) => {
+      hgClientPromise = undefined
+      throw error
+    })
+    return hgClientPromise
+  }
+
+  let hgGames = []
+  let hgGamesAt = 0
+  let hgRefreshing
+  const hgManifests = new Map()
+
+  /** 首页模块的前几页拼成一份列表；封面走 SDK 的图片 CDN。 */
+  async function gatherHuangguo() {
+    const sdk = await hgClient()
+    const seen = new Map()
+    const modules = await sdk.modules()
+    for (const module of modules.slice(0, 6)) {
+      let page
+      try {
+        page = await sdk.discover({ moduleId: module.id, pageSize: 12 })
+      } catch {
+        continue
+      }
+      for (const item of page.items) {
+        if (!item?.id || seen.has(item.id)) continue
+        seen.set(item.id, {
+          id: item.id,
+          title: item.title,
+          description: '',
+          cover: sdk.coverURL(item.verticalCover || item.horizontalCover || ''),
+          episodes: item.totalEpisode,
+        })
+      }
+      if (seen.size >= 48) break
+    }
+    return [...seen.values()].slice(0, 48)
+  }
+
+  function refreshHuangguo() {
+    hgRefreshing ??= (async () => {
+      try {
+        const items = await gatherHuangguo()
+        if (items.length > 0) {
+          hgGames = items
+          hgGamesAt = Date.now()
+        }
+      } catch (error) {
+        logger.warn?.(`[huangguo] feed refresh failed: ${error?.message ?? error}`)
+      } finally {
+        hgRefreshing = undefined
+      }
+    })()
+    return hgRefreshing
   }
 
   async function handleHttp(request, response, url) {
@@ -659,6 +752,39 @@ export function apply(ctx, config = {}) {
       return
     }
 
+    if (path === '/hg-manifest') {
+      const episodeId = safeId(url.searchParams.get('episode'))
+      if (!episodeId) return send(400, { ok: false, error: { message: 'bad episode' } })
+      const cached = hgManifests.get(episodeId)
+      if (cached && Date.now() - cached.at < 45_000) {
+        response.statusCode = 200
+        response.setHeader('content-type', 'application/vnd.apple.mpegurl')
+        response.setHeader('cache-control', 'no-store')
+        return response.end(cached.body)
+      }
+      try {
+        const sdk = await hgClient()
+        const info = await sdk.getEpisode(episodeId)
+        const videoUrl = info?.videoUrl || info?.previewVideoUrl
+        if (!videoUrl) throw Object.assign(new Error('这一集需要购买或会员才能播放'), { code: 'PAY_REQUIRED' })
+        const playlistURL = sdk.playbackURL(videoUrl)
+        const upstream = await fetch(playlistURL, {
+          headers: { 'user-agent': sdk.userAgent },
+          signal: AbortSignal.timeout(30_000),
+        })
+        if (!upstream.ok) throw new Error(`播放列表 HTTP ${upstream.status}`)
+        const body = rewriteManifest(await upstream.text(), playlistURL)
+        hgManifests.set(episodeId, { body, at: Date.now() })
+        while (hgManifests.size > 32) hgManifests.delete(hgManifests.keys().next().value)
+        response.statusCode = 200
+        response.setHeader('content-type', 'application/vnd.apple.mpegurl')
+        response.setHeader('cache-control', 'no-store')
+        return response.end(body)
+      } catch (error) {
+        return send(error?.status ?? 502, { ok: false, error: { code: error?.code, message: String(error?.message ?? error) } })
+      }
+    }
+
     if (path === '/config') {
       return json(async () => {
         const current = readConfig()
@@ -676,6 +802,19 @@ export function apply(ctx, config = {}) {
     }
 
     if (path === '/feed') {
+      const source = url.searchParams.get('source') === 'huangguo' ? 'huangguo' : 'hongguo'
+      if (source === 'huangguo') {
+        return json(async () => {
+          if (hgGames.length > 0 && Date.now() - hgGamesAt < 15 * 60_000) return { items: hgGames }
+          if (hgGames.length > 0) {
+            refreshHuangguo()
+            return { items: hgGames }
+          }
+          await refreshHuangguo()
+          if (hgGames.length === 0) throw Object.assign(new Error('暂时拿不到黄果剧集列表'), { code: 'UNAVAILABLE' })
+          return { items: hgGames }
+        })
+      }
       return json(async () => {
         if (games.length > 0 && Date.now() - gamesAt < 15 * 60_000) return { items: games }
         // A list built a moment ago is good enough while a refresh runs: the
@@ -692,9 +831,42 @@ export function apply(ctx, config = {}) {
     }
 
     if (path === '/series') {
+      const source = url.searchParams.get('source') === 'huangguo' ? 'huangguo' : 'hongguo'
       return json(async () => {
         const id = url.searchParams.get('id')
         if (!id) throw Object.assign(new Error('missing id'), { status: 400 })
+        if (source === 'huangguo') {
+          const sdk = await hgClient()
+          const media = await sdk.getMedia(id).catch(() => undefined)
+          const rows = []
+          let pageNumber = 1
+          let hasMore = true
+          while (hasMore && pageNumber <= 5) {
+            const page = await sdk.listEpisodes(id, { pageNumber, pageSize: 200 })
+            rows.push(...(page.items ?? []))
+            hasMore = Boolean(page.hasMore) && page.items.length > 0
+            pageNumber += 1
+          }
+          const episodes = rows.sort((a, b) => (a.episodeNumber ?? 0) - (b.episodeNumber ?? 0))
+          return {
+            series: {
+              id,
+              title: media?.title,
+              description: media?.summary,
+              cover: sdk.coverURL(media?.verticalCover || media?.horizontalCover || ''),
+              episodes: media?.totalEpisode ?? episodes.length,
+            },
+            episodes: episodes.map((episode) => ({
+              id: episode.id,
+              number: episode.episodeNumber,
+              title: episode.name,
+              cover: episode.cover ? sdk.coverURL(episode.cover) : undefined,
+              // 免费集有 videoUrl；付费集有时带一段试看（previewVideoUrl），也可以播
+              playable: Boolean(episode.videoUrl || episode.previewVideoUrl),
+              preview: !episode.videoUrl && Boolean(episode.previewVideoUrl),
+            })),
+          }
+        }
         const sdk = await client()
         const series = await sdk.getSeries(id).catch(() => undefined)
         const episodes = await sdk.listEpisodes(id)
@@ -712,10 +884,32 @@ export function apply(ctx, config = {}) {
     }
 
     if (path === '/play') {
+      const source = url.searchParams.get('source') === 'huangguo' ? 'huangguo' : 'hongguo'
       return json(async () => {
         const episodeId = url.searchParams.get('episode')
         if (!episodeId) throw Object.assign(new Error('missing episode'), { status: 400 })
         const seriesId = url.searchParams.get('series') ?? undefined
+        if (source === 'huangguo') {
+          const sdk = await hgClient()
+          const info = await sdk.getEpisode(episodeId)
+          if (!info?.videoUrl && !info?.previewVideoUrl) {
+            throw Object.assign(new Error('这一集需要购买或会员才能播放'), { code: 'PAY_REQUIRED', status: 402 })
+          }
+          return {
+            episodeId,
+            seriesId,
+            duration: info.videoUrl ? info.playTime : info.previewSeconds || info.playTime,
+            preview: !info.videoUrl,
+            protected: false,
+            sources: [
+              {
+                definition: 'HLS',
+                kind: 'hlsjs',
+                url: `${ROUTE_PREFIX}/hg-manifest?episode=${encodeURIComponent(episodeId)}`,
+              },
+            ],
+          }
+        }
         const result = await loadStream(episodeId)
         const playback = result.playback
         const streams = (playback.streams ?? []).filter((stream) => stream.url)
