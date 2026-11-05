@@ -75,3 +75,15 @@
 - 数据目录支持 `$DSH_HOME`（原先硬编码 `~/.dsh`）。
 
 已知限制：`panelWidth` 无公开 API 可设（侧边栏自己管宽度）；`/media`、`/stream` 等路由本身仍需登录校验，仅靠 Host 头与 loopback 绑定防护，请勿把 DSH 暴露到局域网或反代出去。
+
+## 测试
+
+```bash
+npm install          # 需要 node_modules/openhongguo
+npm test             # 路由级断言，不需要网络（插件启动时的 feed 预热除外）
+npm run test:media   # 真实 SDK + ffmpeg 解密一集，需要网络与 ffmpeg
+```
+
+`test/route-check.mjs` 用假 `ctx` 调用真实的 `apply()`，再把真实路由 handler 打一遍，覆盖 Host 头校验、`.mjs` MIME、目录穿越、`/stream` 白名单、`/activity`、`/playlist` 空缓存等 11 项断言。
+
+`test/media-check.mjs` 走 `feed → series → play → media` 全链路，校验解密产物是合法 MP4（`ftyp` 头），结束时只清掉自己写入的缓存，原本已存在的那一集不动。
