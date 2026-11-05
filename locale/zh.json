@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "红果短剧",
-    "description": "在右侧边栏播放红果短剧；Agent 运行时提示你调出短剧一起看。基于 openhongguo 匿名接口。"
+    "title": "摸鱼短剧",
+    "description": "在右侧边栏看短剧；Agent 运行时提示你调出短剧一起看。基于 openhongguo 匿名接口。"
   }
 }

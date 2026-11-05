@@ -1,7 +1,7 @@
 /**
  * dsh-hongguo — Client half.
  *
- * Registers one right-Sidebar tab type (`kind: 'hongguo'`) that plays a Hongguo
+ * Registers one right-Sidebar tab type (`kind: 'hongguo'`) that plays a
  * short drama, a small button in the sidebar foot that opens it, and an
  * ambient prompt under the composer that invites the user to open the player
  * while the agent is running. All network work — search, episodes, play models
@@ -19,10 +19,10 @@ window.__ModuleLoader__.load({
     const NS = 'hongguo'
 
     const zh = {
-      'tab.title': '红果短剧',
+      'tab.title': '摸鱼短剧',
       'button.label': '短剧',
-      'button.tooltip': '打开红果短剧',
-      'guide.title': '红果短剧',
+      'button.tooltip': '打开摸鱼短剧',
+      'guide.title': '摸鱼短剧',
       'guide.description': '在边栏里看一部短剧，陪 Agent 一起干活',
       'prompt.title': 'Agent 干活中，刷一集？',
       'prompt.body': '等待的时间里，挑一部短剧放进右侧边栏，边看边等。',
@@ -61,6 +61,7 @@ window.__ModuleLoader__.load({
       'player.startFirst': '从第 1 集开始',
       'player.recommend': '为你推荐',
       'player.historyOpen': '观看历史',
+      'player.search': '搜索短剧',
       'player.historyEmpty': '还没有观看记录',
       'player.episodeOf': '第 {n} 集 · 共 {total} 集',
       'player.chooseEpisode': '选集',
@@ -73,10 +74,10 @@ window.__ModuleLoader__.load({
       'player.error': '出错了：{message}',
     }
     const en = {
-      'tab.title': 'Hongguo drama',
+      'tab.title': 'Drama Break',
       'button.label': 'Drama',
-      'button.tooltip': 'Open Hongguo short dramas',
-      'guide.title': 'Hongguo dramas',
+      'button.tooltip': 'Open Drama Break',
+      'guide.title': 'Drama Break',
       'guide.description': 'Watch a short drama beside the Agent while it works',
       'prompt.title': 'Agent working — squeeze in an episode?',
       'prompt.body': 'Pick a short drama for the right Sidebar and watch while you wait.',
@@ -115,6 +116,7 @@ window.__ModuleLoader__.load({
       'player.startFirst': 'Start from episode 1',
       'player.recommend': 'Recommended for you',
       'player.historyOpen': 'History',
+      'player.search': 'Search dramas',
       'player.historyEmpty': 'Nothing watched yet',
       'player.episodeOf': 'Episode {n} of {total}',
       'player.chooseEpisode': 'Episodes',
@@ -931,13 +933,13 @@ window.__ModuleLoader__.load({
             h('input', {
               className: 'hg-input',
               type: 'search',
-              placeholder: t('guide.title'),
+              placeholder: t('player.search'),
               value: query,
               onChange: (event) => {
                 setQuery(event.target.value)
                 setPage(0)
               },
-              'aria-label': t('guide.title'),
+              'aria-label': t('player.search'),
             }),
           ),
           grid,
@@ -1472,6 +1474,30 @@ window.__ModuleLoader__.load({
         }, 'hongguo: styles')
 
         // The tab type: a page type (no address patterns), opened by kind.
+        // Tabs opened under the plugin's earlier name keep that title in each
+        // session's saved sidebar layout; rename them once to the current one.
+        try {
+          const legacy = new Set(['\u7ea2\u679c\u77ed\u5267', 'Hongguo drama', 'Hongguo dramas'])
+          for (const key of Object.keys(localStorage)) {
+            if (!key.startsWith('dsh.sidebar-right.')) continue
+            const raw = localStorage.getItem(key)
+            if (!raw || !raw.includes('"kind":"' + KIND + '"')) continue
+            const layout = JSON.parse(raw)
+            let changed = false
+            const visit = (node) => {
+              if (!node || typeof node !== 'object') return
+              if (node.kind === KIND && legacy.has(node.title)) {
+                node.title = translate('tab.title')
+                changed = true
+              }
+              for (const value of Object.values(node)) visit(value)
+            }
+            visit(layout)
+            if (changed) localStorage.setItem(key, JSON.stringify(layout))
+          }
+        } catch {
+          // A layout this code does not understand is left as it is.
+        }
         const sidebarRightTabs = ctx.get('sidebarRightTabs')
         if (sidebarRightTabs?.register) {
           ctx.effect(
