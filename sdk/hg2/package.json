@@ -1,0 +1,17 @@
+{
+  "name": "hg2",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "com.hg2.two_zero_one 的非官方 API 客户端：目录、搜索、分集与播放地址",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "bin": {
+    "hg2": "./cli.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

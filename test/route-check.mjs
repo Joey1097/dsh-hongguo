@@ -153,6 +153,20 @@ check('media rejects a bad episode id', async () => {
   assert.equal(res.statusCode, 400)
 })
 
+check('every prefix is behind the Host guard, including the newer routes', async () => {
+  // The guard wraps the three registered prefixes, so a route added later is
+  // covered by construction; assert it for the alternate-source routes too.
+  for (const path of [
+    '/api/hongguo/search?keyword=x',
+    '/api/hongguo/hg2-manifest?u=https%3A%2F%2Fexample.com%2Fx.m3u8',
+    '/api/hongguo/cover?u=https%3A%2F%2Fexample.com%2Fx.jpg',
+    '/api/hongguo/vendor/mpegts.js',
+  ]) {
+    const res = await hit(path, { host: 'attacker.example:62408' })
+    assert.equal(res.statusCode, 403, `${path} should be guarded`)
+  }
+})
+
 const settled = await Promise.all(results)
 let failed = 0
 for (const row of settled) {
