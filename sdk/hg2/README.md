@@ -1,4 +1,4 @@
-# huangguo（黄果短剧 API 客户端）
+# hg2（com.hg2.two_zero_one 的 API 客户端）
 
 从 APK `hgdj22.0.0.apk`（包名 `com.hg2.two_zero_one`，versionName `2.0.1`）逆向出的非官方客户端，
 能力与 openhongguo 类似：浏览目录、搜索、取分集、解析播放地址。
@@ -66,7 +66,7 @@ node cli.js play 6aa904e52dfb04df318357f5 1
 ## 认证与设备档案
 
 `createClient()` 首次运行会注册一台匿名设备（`devID` + `devToken`）调用 `/mine/login` 换 `token`，
-之后把 `devID` 和 `token` 保存到 `~/.config/huangguo/profile.json`（权限 0600；`HG_CONFIG_DIR` 可改目录）。
+之后把 `devID` 和 `token` 保存到 `~/.config/hg2/profile.json`（权限 0600；`HG2_CONFIG_DIR` 可改目录）。
 token 失效（`5005`/`5009`）时自动重新登录一次。
 
 登录接口有限流（`4007 登录过于频繁`），所以不要每次调用都新建设备；复用档案即可。
@@ -89,4 +89,4 @@ index.js   客户端（签名、解密、登录、接口）
 cli.js     命令行示例
 ```
 
-实现细节与逆向过程见 [`reverse-engineering.md`](reverse-engineering.md)。
+实现细节与逆向过程见 [`reverse-engineering.md`](../../docs/reverse-engineering.md)。

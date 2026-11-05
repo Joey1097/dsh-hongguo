@@ -62,6 +62,8 @@ window.__ModuleLoader__.load({
       'player.recommend': '为你推荐',
       'player.historyOpen': '观看历史',
       'player.search': '搜索短剧',
+      'player.searching': '搜索中…',
+      'player.noResults': '没有找到“{q}”相关的短剧',
       'player.historyEmpty': '还没有观看记录',
       'player.episodeOf': '第 {n} 集 · 共 {total} 集',
       'player.chooseEpisode': '选集',
@@ -72,9 +74,9 @@ window.__ModuleLoader__.load({
       'player.watchNow': '现在就看',
       'player.drm': '这一集是加密流，且未能在本机解密（需要安装 ffmpeg）',
       'player.error': '出错了：{message}',
-      'source.switch': '切换片源（红果 / 黄果）',
+      'source.switch': '切换片源',
       'source.hongguo': '红果',
-      'source.huangguo': '黄果',
+      'source.hg2': '备用片源',
       'source.payRequired': '这一集需要购买或会员才能播放',
       'player.noFree': '这部剧没有可免费播放的集',
     }
@@ -122,6 +124,8 @@ window.__ModuleLoader__.load({
       'player.recommend': 'Recommended for you',
       'player.historyOpen': 'History',
       'player.search': 'Search dramas',
+      'player.searching': 'Searching…',
+      'player.noResults': 'No dramas found for “{q}”',
       'player.historyEmpty': 'Nothing watched yet',
       'player.episodeOf': 'Episode {n} of {total}',
       'player.chooseEpisode': 'Episodes',
@@ -129,9 +133,9 @@ window.__ModuleLoader__.load({
       'player.fullscreen': 'Fullscreen',
       'player.play': 'Play',
       'player.pause': 'Pause',
-      'source.switch': 'Switch source (Hongguo / Huangguo)',
+      'source.switch': 'Switch source',
       'source.hongguo': 'Hongguo',
-      'source.huangguo': 'Huangguo',
+      'source.hg2': 'Alternate source',
       'source.payRequired': 'This episode needs a purchase or membership',
       'player.noFree': 'No free episodes in this drama',
       'player.watchNow': 'Watch now',
@@ -386,17 +390,17 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 片源：hongguo = 红果（openhongguo SDK），huangguo = 黄果（APK 逆向接口）。
+     * 片源：hongguo = 主用（openhongguo SDK），hg2 = 备用（APK 逆向接口）。
      * 选择记在 localStorage，刷新后保持；两个片源的列表和观看历史互不影响。
      */
     let preferredSource = 'hongguo'
     try {
-      if (localStorage.getItem('hg.source') === 'huangguo') preferredSource = 'huangguo'
+      if (localStorage.getItem('hg.source') === 'hg2') preferredSource = 'hg2'
     } catch {
       // 隐私模式下读不到 localStorage，用默认片源即可。
     }
     function setPreferredSource(source) {
-      preferredSource = source === 'huangguo' ? 'huangguo' : 'hongguo'
+      preferredSource = source === 'hg2' ? 'hg2' : 'hongguo'
       try {
         localStorage.setItem('hg.source', preferredSource)
       } catch {
@@ -456,11 +460,11 @@ window.__ModuleLoader__.load({
     // slot, and a short list of recently watched dramas. They are the only
     // persisted player state; everything else is derived from the Host.
     const HISTORY_KEY = 'dsh-hongguo.watch-history.v1'
-    /** 每个片源一份历史：红果和黄果的“看到第几集”完全隔离。 */
+    /** 每个片源一份历史：两个片源的“看到第几集”完全隔离。 */
     function historyKey(source = preferredSource) {
-      return `${HISTORY_KEY}.${source === 'huangguo' ? 'huangguo' : 'hongguo'}`
+      return `${HISTORY_KEY}.${source === 'hg2' ? 'hg2' : 'hongguo'}`
     }
-    // 老版本只有一把不带片源后缀的 key；第一次运行时搬到红果名下。
+    // 老版本只有一把不带片源后缀的 key；第一次运行时搬到默认片源名下。
     try {
       const legacy = localStorage.getItem(HISTORY_KEY)
       if (legacy && !localStorage.getItem(historyKey('hongguo'))) localStorage.setItem(historyKey('hongguo'), legacy)
@@ -558,8 +562,11 @@ window.__ModuleLoader__.load({
      */
     function DramaPlayer({ requested, compact }) {
       const t = useTranslate()
-      /** 当前片源：'hongguo' 红果 / 'huangguo' 黄果。切换时列表和历史一起换。 */
+      /** 当前片源：'hongguo' 主用 / 'hg2' 备用。切换时列表和历史一起换。 */
       const [source, setSource] = React.useState(preferredSource)
+      /** Results of the server-side search for the current query and source. */
+      const [found, setFound] = React.useState({ status: 'idle', keyword: '', items: [], error: undefined })
+      const [searchTick, setSearchTick] = React.useState(0)
       const [feed, setFeed] = React.useState({ status: 'loading', items: [], error: undefined })
       const [query, setQuery] = React.useState('')
       const [series, setSeries] = React.useState(undefined)
@@ -675,9 +682,9 @@ window.__ModuleLoader__.load({
         [playEpisode, source],
       )
 
-      /** 图标切换片源：红果 ↔ 黄果；列表、分集、历史都跟着换。 */
+      /** 图标切换片源：主用 ↔ 备用；列表、分集、历史都跟着换。 */
       const toggleSource = React.useCallback(() => {
-        const next = source === 'huangguo' ? 'hongguo' : 'huangguo'
+        const next = source === 'hg2' ? 'hongguo' : 'hg2'
         setPreferredSource(next)
         setSource(next)
         setSeries(undefined)
@@ -867,17 +874,45 @@ window.__ModuleLoader__.load({
         return fresh[0] ?? feed.items[0]
       }, [feed.items, watched])
 
+      // Search asks the source itself; the cached list only holds a few dozen
+      // dramas. Typing waits for a pause, Enter searches at once, and a
+      // reply for an older query is dropped.
+      const keyword = query.trim()
+      React.useEffect(() => {
+        if (!keyword) {
+          setFound({ status: 'idle', keyword: '', items: [], error: undefined })
+          return undefined
+        }
+        let stale = false
+        setFound((previous) => ({ ...previous, status: 'loading', keyword }))
+        const timer = setTimeout(() => {
+          callApi(`/search?${sourceQuery(source)}&q=${encodeURIComponent(keyword)}`)
+            .then((body) => {
+              if (!stale) setFound({ status: 'ready', keyword, items: body.items ?? [], error: undefined })
+            })
+            .catch((error) => {
+              if (!stale) setFound({ status: 'error', keyword, items: [], error })
+            })
+        }, searchTick > 0 ? 0 : 400)
+        return () => {
+          stale = true
+          clearTimeout(timer)
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [keyword, source, searchTick])
+
       const PAGE = 12
       // The featured drama is already on screen; the grid shows the others.
-      const pool = query.trim()
-        ? feed.items.filter((item) => String(item.title ?? '').includes(query.trim()))
+      const pool = keyword
+        ? found.items
         : feed.items.filter((item) => item && item.id !== recommendation?.id)
       const pageCount = Math.max(1, Math.ceil(pool.length / PAGE))
-      const shownPage = query.trim() ? 0 : page % pageCount
+      const shownPage = page % pageCount
       const visible = pool.slice(shownPage * PAGE, shownPage * PAGE + PAGE)
       /** Next twelve; after the last page, fetch a fresh list and start over. */
       const nextBatch = () => {
         if (shownPage + 1 < pageCount) setPage(shownPage + 1)
+        else if (keyword) setPage(0)
         else {
           setPage(0)
           fetchFeed(true)
@@ -925,7 +960,7 @@ window.__ModuleLoader__.load({
                 'aria-label': t('source.switch'),
                 onClick: toggleSource,
               },
-              h(Mark, { size: 18, tone: source === 'huangguo' ? 'yellow' : 'red' }),
+              h(Mark, { size: 18, tone: source === 'hg2' ? 'yellow' : 'red' }),
             ),
         h(
           'div',
@@ -955,7 +990,10 @@ window.__ModuleLoader__.load({
       let content
       if (!series) {
         let grid
-        if (feed.status === 'error') grid = h(ErrorBox, { error: feed.error, onRetry: loadFeed })
+        if (keyword && found.status === 'error') grid = h(ErrorBox, { error: found.error, onRetry: () => setSearchTick((value) => value + 1) })
+        else if (keyword && (found.status === 'loading' || found.keyword !== keyword)) grid = h('div', { className: 'hg-muted' }, t('player.searching'))
+        else if (keyword && visible.length === 0) grid = h('div', { className: 'hg-empty' }, t('player.noResults').replace('{q}', keyword))
+        else if (feed.status === 'error') grid = h(ErrorBox, { error: feed.error, onRetry: loadFeed })
         else if (feed.status === 'loading' && visible.length === 0) grid = h('div', { className: 'hg-muted' }, t('player.loading'))
         else if (visible.length === 0) grid = h('div', { className: 'hg-empty' }, t('player.noSource'))
         else
@@ -1044,6 +1082,10 @@ window.__ModuleLoader__.load({
               onChange: (event) => {
                 setQuery(event.target.value)
                 setPage(0)
+                setSearchTick(0)
+              },
+              onKeyDown: (event) => {
+                if (event.key === 'Enter' && !event.nativeEvent.isComposing) setSearchTick((value) => value + 1)
               },
               'aria-label': t('player.search'),
             }),

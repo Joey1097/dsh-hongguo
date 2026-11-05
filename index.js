@@ -18,7 +18,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
 import { createClient } from 'openhongguo'
-import { Client as HuangguoClient } from './sdk/huangguo/index.js'
+import { Client as Hg2Client } from './sdk/hg2/index.js'
 
 export const name = 'dsh-hongguo'
 
@@ -384,7 +384,7 @@ export function apply(ctx, config = {}) {
    * serves only the composed client module, so these assets get their own
    * prefix route on the same Web server.
    */
-  /** 黄果图片 CDN 会把图片前 100 字节与固定串异或（image_crypto.dart）。 */
+  /** HG2 图片 CDN 会把图片前 100 字节与固定串异或（image_crypto.dart）。 */
   const IMAGE_XOR_KEY = Buffer.from('2019ysapp7527', 'latin1')
   function xorImageHead(bytes) {
     const out = Buffer.from(bytes)
@@ -442,7 +442,7 @@ export function apply(ctx, config = {}) {
     }
     const type = upstream.headers.get('content-type') ?? ''
     let bytes = Buffer.from(await upstream.arrayBuffer())
-    // 黄果的图片 CDN 常把 JPEG 标成 application/octet-stream；先按魔数判断，
+    // HG2 的图片 CDN 常把 JPEG 标成 application/octet-stream；先按魔数判断，
     // 不像图片时再按前 100 字节异或还原一次。
     let sniffed = sniffImage(bytes)
     if (!sniffed) {
@@ -555,6 +555,9 @@ export function apply(ctx, config = {}) {
     return featured.length >= 12 ? featured : rows.slice(0, 48)
   }
 
+  /** Posters looked up for search results, by series id. */
+  const searchCovers = new Map()
+
   /** Rebuild the cached list in the background. */
   let refreshing
   function refreshFeed() {
@@ -575,14 +578,15 @@ export function apply(ctx, config = {}) {
     return refreshing
   }
 
-  // ---- 黄果短剧（huangguo）--------------------------------------------------
+  // ---- 备用片源（hg2）------------------------------------------------------
   // 第二个片源：APK 逆向出的 JSON 接口 + HLS（AES-128）。设备档案单独一份，
   // 与红果的 openhongguo 档案互不影响。
-  const hgProfilePath = join(dataDir, 'huangguo-profile.json')
+  /** 备用片源的匿名设备档案，与红果那份分开。 */
+  const hgProfilePath = join(dataDir, 'hg2-profile.json')
   let hgClientPromise
   function hgClient() {
     hgClientPromise ??= (async () => {
-      const sdk = new HuangguoClient({ profile: hgProfilePath, timeoutMs: 25_000 })
+      const sdk = new Hg2Client({ profile: hgProfilePath, timeoutMs: 25_000 })
       await sdk.ensureLogin()
       return sdk
     })().catch((error) => {
@@ -598,7 +602,7 @@ export function apply(ctx, config = {}) {
   const hgManifests = new Map()
 
   /** 首页模块的前几页拼成一份列表；封面走 SDK 的图片 CDN。 */
-  async function gatherHuangguo() {
+  async function gatherHg2() {
     const sdk = await hgClient()
     const seen = new Map()
     const modules = await sdk.modules()
@@ -624,16 +628,16 @@ export function apply(ctx, config = {}) {
     return [...seen.values()].slice(0, 48)
   }
 
-  function refreshHuangguo() {
+  function refreshHg2() {
     hgRefreshing ??= (async () => {
       try {
-        const items = await gatherHuangguo()
+        const items = await gatherHg2()
         if (items.length > 0) {
           hgGames = items
           hgGamesAt = Date.now()
         }
       } catch (error) {
-        logger.warn?.(`[huangguo] feed refresh failed: ${error?.message ?? error}`)
+        logger.warn?.(`[hg2] feed refresh failed: ${error?.message ?? error}`)
       } finally {
         hgRefreshing = undefined
       }
@@ -752,7 +756,7 @@ export function apply(ctx, config = {}) {
       return
     }
 
-    if (path === '/hg-manifest') {
+    if (path === '/hg2-manifest') {
       const episodeId = safeId(url.searchParams.get('episode'))
       if (!episodeId) return send(400, { ok: false, error: { message: 'bad episode' } })
       const cached = hgManifests.get(episodeId)
@@ -802,16 +806,16 @@ export function apply(ctx, config = {}) {
     }
 
     if (path === '/feed') {
-      const source = url.searchParams.get('source') === 'huangguo' ? 'huangguo' : 'hongguo'
-      if (source === 'huangguo') {
+      const source = url.searchParams.get('source') === 'hg2' ? 'hg2' : 'hongguo'
+      if (source === 'hg2') {
         return json(async () => {
           if (hgGames.length > 0 && Date.now() - hgGamesAt < 15 * 60_000) return { items: hgGames }
           if (hgGames.length > 0) {
-            refreshHuangguo()
+            refreshHg2()
             return { items: hgGames }
           }
-          await refreshHuangguo()
-          if (hgGames.length === 0) throw Object.assign(new Error('暂时拿不到黄果剧集列表'), { code: 'UNAVAILABLE' })
+          await refreshHg2()
+          if (hgGames.length === 0) throw Object.assign(new Error('暂时拿不到备用片源的剧集列表'), { code: 'UNAVAILABLE' })
           return { items: hgGames }
         })
       }
@@ -830,12 +834,69 @@ export function apply(ctx, config = {}) {
       })
     }
 
+    // Real search on the selected source, not a filter over the cached list.
+    if (path === '/search') {
+      const source = url.searchParams.get('source') === 'hg2' ? 'hg2' : 'hongguo'
+      const keyword = (url.searchParams.get('q') ?? '').trim().slice(0, 40)
+      if (!keyword) return send(400, { ok: false, error: { message: 'empty query' } })
+      if (source === 'hg2') {
+        return json(async () => {
+          const sdk = await hgClient()
+          const page = await sdk.search(keyword, { pageSize: 24 })
+          const items = (page?.items ?? [])
+            .filter((item) => item?.id)
+            .map((item) => ({
+              id: item.id,
+              title: item.title,
+              description: '',
+              cover: sdk.coverURL(item.verticalCover || item.horizontalCover || ''),
+              episodes: item.totalEpisode,
+            }))
+          return { items }
+        })
+      }
+      return json(async () => {
+        const sdk = await client()
+        let page
+        try {
+          page = await sdk.search(keyword, {})
+        } catch (error) {
+          if (error?.code !== 'ANONYMOUS_LIMITED') throw error
+          // The anonymous device ran out; a fresh one answers the same query.
+          await sdk.resetDevice()
+          page = await sdk.search(keyword, {})
+        }
+        const seen = new Map()
+        for (const item of page?.items ?? []) mergeRows(seen, item)
+        const rows = [...seen.values()]
+        // Search rows carry no poster; the cached list or the series detail does.
+        const known = new Map(games.map((row) => [row.id, row.cover]))
+        await Promise.all(
+          rows.map(async (row) => {
+            if (row.cover) return
+            row.cover = known.get(row.id) ?? searchCovers.get(row.id)
+            if (row.cover) return
+            try {
+              const detail = await sdk.getSeries(row.id)
+              if (detail?.cover_url) {
+                row.cover = detail.cover_url
+                searchCovers.set(row.id, detail.cover_url)
+              }
+            } catch {
+              // A drama without a poster still shows, with the placeholder.
+            }
+          }),
+        )
+        return { items: rows }
+      })
+    }
+
     if (path === '/series') {
-      const source = url.searchParams.get('source') === 'huangguo' ? 'huangguo' : 'hongguo'
+      const source = url.searchParams.get('source') === 'hg2' ? 'hg2' : 'hongguo'
       return json(async () => {
         const id = url.searchParams.get('id')
         if (!id) throw Object.assign(new Error('missing id'), { status: 400 })
-        if (source === 'huangguo') {
+        if (source === 'hg2') {
           const sdk = await hgClient()
           const media = await sdk.getMedia(id).catch(() => undefined)
           const rows = []
@@ -884,12 +945,12 @@ export function apply(ctx, config = {}) {
     }
 
     if (path === '/play') {
-      const source = url.searchParams.get('source') === 'huangguo' ? 'huangguo' : 'hongguo'
+      const source = url.searchParams.get('source') === 'hg2' ? 'hg2' : 'hongguo'
       return json(async () => {
         const episodeId = url.searchParams.get('episode')
         if (!episodeId) throw Object.assign(new Error('missing episode'), { status: 400 })
         const seriesId = url.searchParams.get('series') ?? undefined
-        if (source === 'huangguo') {
+        if (source === 'hg2') {
           const sdk = await hgClient()
           const info = await sdk.getEpisode(episodeId)
           if (!info?.videoUrl && !info?.previewVideoUrl) {
@@ -905,7 +966,7 @@ export function apply(ctx, config = {}) {
               {
                 definition: 'HLS',
                 kind: 'hlsjs',
-                url: `${ROUTE_PREFIX}/hg-manifest?episode=${encodeURIComponent(episodeId)}`,
+                url: `${ROUTE_PREFIX}/hg2-manifest?episode=${encodeURIComponent(episodeId)}`,
               },
             ],
           }

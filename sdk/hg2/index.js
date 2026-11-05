@@ -1,4 +1,4 @@
-// 黄果短剧（com.hg2.two_zero_one）非官方 API 客户端。
+// com.hg2.two_zero_one（代号 HG2）的非官方 API 客户端。
 //
 // 请求：HMAC-SHA1 签名（x-api-key）；响应：AES-128-CBC（密钥/IV 由响应前 12 字节 + 固定种子
 // 经三轮 SHA-256 派生）；登录：devID + devToken 换取 token。
@@ -26,10 +26,10 @@ const DEFAULT_IMAGE_BASE = 'https://zzzznnn.lkkwip.cn';
 /** 搜索 kind：4 = 真人短剧。 */
 export const SearchKind = Object.freeze({ ShortPlay: 4 });
 
-export class HuangguoError extends Error {
+export class Hg2Error extends Error {
   constructor(message, { code, payload } = {}) {
     super(message);
-    this.name = 'HuangguoError';
+    this.name = 'Hg2Error';
     this.code = code;
     this.payload = payload;
   }
@@ -72,7 +72,7 @@ export function signRequest({ path: requestPath, timestamp, nonce, token, userAg
 }
 
 export function defaultProfilePath() {
-  const dir = process.env.HG_CONFIG_DIR || path.join(os.homedir(), '.config', 'huangguo');
+  const dir = process.env.HG2_CONFIG_DIR || path.join(os.homedir(), '.config', 'hg2');
   return path.join(dir, 'profile.json');
 }
 
@@ -125,7 +125,7 @@ export class Client {
         await this.request('/ping/checkMessageTip', { auth: true, noRetry: true });
         return this.authToken;
       } catch (error) {
-        if (!(error instanceof HuangguoError) || ![5005, 5009].includes(error.code)) throw error;
+        if (!(error instanceof Hg2Error) || ![5005, 5009].includes(error.code)) throw error;
         this.authToken = '';
       }
     }
@@ -147,7 +147,7 @@ export class Client {
     };
     const data = await this.request('/mine/login', { method: 'POST', body, auth: false });
     if (!data || typeof data !== 'object' || !data.token) {
-      throw new HuangguoError('登录失败：响应中没有 token', { payload: data });
+      throw new Hg2Error('登录失败：响应中没有 token', { payload: data });
     }
     this.authToken = data.token;
     this.devID = devID;
@@ -189,7 +189,7 @@ export class Client {
       signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (!response.ok) {
-      throw new HuangguoError(`HTTP ${response.status}`, { code: response.status });
+      throw new Hg2Error(`HTTP ${response.status}`, { code: response.status });
     }
     const json = await response.json();
     if (json.hash && typeof json.data === 'string') {
@@ -203,7 +203,7 @@ export class Client {
       return this.request(requestPath, { ...options, _retried: true });
     }
     if (json.code !== 200) {
-      throw new HuangguoError(json.msg || `接口错误 ${json.code}`, { code: json.code, payload: json });
+      throw new Hg2Error(json.msg || `接口错误 ${json.code}`, { code: json.code, payload: json });
     }
     return json.data;
   }
@@ -217,7 +217,7 @@ export class Client {
   /** 某个模块的内容（轮播 + 列表）。 */
   async discover({ moduleId, pageNumber = 1, pageSize = 20 } = {}) {
     const id = moduleId || (await this.modules())[0]?.id;
-    if (!id) throw new HuangguoError('没有可用的 moduleId');
+    if (!id) throw new Hg2Error('没有可用的 moduleId');
     const data = await this.request('/media/drama/home', {
       params: { moduleId: id, pageNumber, pageSize },
     });
@@ -285,7 +285,7 @@ export class Client {
     const videoUrl = info?.videoUrl;
     if (!videoUrl) {
       const paywalled = info && (info.canPlay === false || (info.listenPermission ?? 0) !== 2);
-      throw new HuangguoError(paywalled ? '这一集需要购买或会员才能播放' : '这一集没有可播放地址', {
+      throw new Hg2Error(paywalled ? '这一集需要购买或会员才能播放' : '这一集没有可播放地址', {
         code: paywalled ? 'PAY_REQUIRED' : 'NO_VIDEO',
         payload: info,
       });
@@ -295,7 +295,7 @@ export class Client {
       headers: { 'User-Agent': this.userAgent },
       signal: AbortSignal.timeout(this.timeoutMs),
     });
-    if (!response.ok) throw new HuangguoError(`播放列表 HTTP ${response.status}`, { code: response.status });
+    if (!response.ok) throw new Hg2Error(`播放列表 HTTP ${response.status}`, { code: response.status });
     const playlist = await response.text();
     const keyMatch = playlist.match(/#EXT-X-KEY:.*URI="([^"]+)"/);
     const segments = playlist

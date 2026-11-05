@@ -1,7 +1,7 @@
-# 黄果短剧 APK 逆向：视频列表与播放地址
+# com.hg2.two_zero_one APK 逆向：视频列表与播放地址
 
-对象：`downloads/hgdj22.0.0.apk`（应用名「黄果短剧」，包名 `com.hg2.two_zero_one`，
-`versionName 2.0.1` / 对外版本 22.0.0）。客户端实现见 [`../sdk/huangguo`](../sdk/huangguo)。
+对象：`downloads/hgdj22.0.0.apk`（包名 `com.hg2.two_zero_one`，
+`versionName 2.0.1` / 对外版本 22.0.0）。客户端实现见 [`../sdk/hg2`](../sdk/hg2)。
 
 > 本文只记录接口与算法，用于互操作性研究。内容与商标归权利人所有。
 
@@ -65,7 +65,7 @@ sign = hex(HMAC-SHA1(key, jsonEncode(params)))   // JSON 无空格、键序同�
 x-api-key = "timestamp=<ts>;sign=<sign>;nonce=<nonce>"
 ```
 
-固定 key 在 `http_manager.dart` 中（见 `sdk/huangguo/index.js` 的 `SIGN_KEY`）。
+固定 key 在 `http_manager.dart` 中（见 `sdk/hg2/index.js` 的 `SIGN_KEY`）。
 
 其余请求头：
 
@@ -126,7 +126,7 @@ iv  = h3[0:4] + h2[12:20] + h3[28:32]     // 16 字节
 plain = AES-256-CBC-decrypt(key, iv, body) // PKCS#7
 ```
 
-`AES_SEED` 见 `sdk/huangguo/index.js`。
+`AES_SEED` 见 `sdk/hg2/index.js`。
 
 > 复盘提示：blutter 反汇编里 `sublist` 的 **start 参数是未打标签的整数，end 参数是 Smi（×2）**。
 > 按统一 Smi 去读会得出 48 字节密钥而卡住；按“start 原值、end 减半”读就与上面的切片完全吻合。
@@ -196,8 +196,8 @@ SDK 提供 `episodeStats()` / `isFullyFree()` / `listFreeSeries()`：
 ## 11. 复现
 
 ```sh
-# 依赖安装与完整客户端见 sdk/huangguo
-cd sdk/huangguo
+# 依赖安装与完整客户端见 sdk/hg2
+cd sdk/hg2
 node cli.js search 寡妇
 node cli.js play <mediaId> 1
 ```
