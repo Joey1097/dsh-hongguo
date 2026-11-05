@@ -33,20 +33,8 @@
 
 ## 结构
 
-- **Host 半（`index.js`）**：加载 openhongguo SDK、维护匿名设备档案，提供同源路由 `/api/hongguo/{feed,series,play,search,hg2-manifest,media,stream,config,running}`、`/api/hongguo/cover` 与 `/api/hongguo/vendor`。启动时预先拉取剧集列表。CDN 只提供 HEIC 封面，Host 用 `sips`（macOS）或 `ffmpeg`（其他平台）转成 JPEG 并缓存。
+- **Host 半（`index.js`）**：加载 openhongguo SDK、维护匿名设备档案，提供同源路由 `/api/hongguo/{feed,series,play,search,media,stream,config,running}`、`/api/hongguo/cover` 与 `/api/hongguo/vendor`。启动时预先拉取剧集列表。CDN 只提供 HEIC 封面，Host 用 `sips`（macOS）或 `ffmpeg`（其他平台）转成 JPEG 并缓存。
 - **Client 半（`client.js`）**：注册侧边栏标签页类型 `hongguo`、侧栏底部按钮，以及 `conversation.input.dock` 里的等待提示。
-
-## 片源
-
-标题左侧的图标切换片源，两个片源的列表、分集和观看历史互不影响：
-
-| 片源 | 来源 | 说明 |
-|---|---|---|
-| `hongguo`（默认） | [openhongguo](https://github.com/beilunyang/openhongguo) | 匿名设备，CENC 视频由 Host 解密 |
-| `hg2`（备用） | `com.hg2.two_zero_one` APK 逆向接口（见 [`docs/reverse-engineering.md`](docs/reverse-engineering.md)） | HLS + AES-128，一部分剧需要购买或会员 |
-
-备用片源在 `sdk/hg2/` 下自带一份不依赖第三方包的客户端（签名、解密、登录），
-可以单独用 `node sdk/hg2/cli.js search <关键词>` 试接口。
 
 ## 播放与解密
 
