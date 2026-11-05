@@ -74,6 +74,22 @@ const STREAM_PREFERENCE = ['hls', 'dash', 'file']
 /** Convert one image with macOS `sips` (HEIC is what the CDN publishes). */
 const sips = promisify(execFile).bind(null, 'sips')
 
+/**
+ * The CDN publishes HEIC posters, which Chromium cannot decode. macOS ships
+ * `sips`; everywhere else the ffmpeg the player already requires can decode
+ * HEIC, because libavcodec reads the HEIF still as a one-frame HEVC stream.
+ */
+function coverConverter(runFfmpeg) {
+  if (process.platform === 'darwin') {
+    return async (rawPath, outPath) => {
+      await sips(['-s', 'format', 'jpeg', '-s', 'formatOptions', '70', '--resampleWidth', '240', rawPath, '--out', outPath])
+    }
+  }
+  return async (rawPath, outPath) => {
+    await runFfmpeg(['-v', 'error', '-y', '-i', rawPath, '-frames:v', '1', '-vf', 'scale=240:-2', '-q:v', '6', '-update', '1', outPath], { timeout: 30_000 })
+  }
+}
+
 /** A profile store on one JSON file, 0600 like the SDK's own file store. */
 function fileProfileStore(path) {
   return {
@@ -184,8 +200,18 @@ export function apply(ctx, config = {}) {
   const mediaKeys = new Map()
   const mediaJobs = new Map()
   const MEDIA_KEEP = 40
-  const ffmpegBin = ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg'].find((path) => existsSync(path)) ?? 'ffmpeg'
+  const ffmpegBin =
+    [
+      '/opt/homebrew/bin/ffmpeg',
+      '/usr/local/bin/ffmpeg',
+      '/usr/bin/ffmpeg',
+      // Windows: WinGet's shim directory, then a plain Program Files install;
+      // anything else (scoop, choco) is expected on PATH, which is the fallback.
+      process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Microsoft', 'WinGet', 'Links', 'ffmpeg.exe') : '',
+      process.env.ProgramFiles ? join(process.env.ProgramFiles, 'ffmpeg', 'bin', 'ffmpeg.exe') : '',
+    ].find((path) => path && existsSync(path)) ?? 'ffmpeg'
   const runFfmpeg = promisify(execFile).bind(null, ffmpegBin)
+  const convertCover = coverConverter(runFfmpeg)
 
   function safeId(id) {
     return /^[0-9A-Za-z_-]{1,64}$/.test(String(id ?? '')) ? String(id) : undefined
@@ -384,9 +410,9 @@ export function apply(ctx, config = {}) {
    * prefix route on the same Web server.
    */
   /**
-   * Serve one cover as JPEG. The CDN only publishes HEIC, which Chromium
-   * cannot decode; macOS ships `sips` for the conversion, and the result is
-   * cached on disk so each poster is converted once.
+   * Serve one cover as JPEG. The CDN publishes HEIC, which Chromium cannot
+   * decode, so anything that is not already a browser format is converted once
+   * and cached on disk.
    */
   async function serveCover(request, response, url) {
     const source = url.searchParams.get('u') ?? ''
@@ -427,13 +453,13 @@ export function apply(ctx, config = {}) {
     const type = upstream.headers.get('content-type') ?? ''
     const bytes = Buffer.from(await upstream.arrayBuffer())
     if (/^image\/(jpeg|png|webp|gif|avif)/.test(type)) return sendJpeg(bytes)
-    // HEIC and everything else local ImageIO understands goes through sips.
+    // HEIC goes through the platform converter (sips on macOS, ffmpeg elsewhere).
     const rawPath = join(coverDir, `${key}.heic`)
     const outPath = `${key}.jpg`
     try {
       await mkdir(coverDir, { recursive: true, mode: 0o700 })
       await writeFile(rawPath, bytes)
-      await sips(['-s', 'format', 'jpeg', '-s', 'formatOptions', '70', '--resampleWidth', '240', rawPath, '--out', join(coverDir, outPath)])
+      await convertCover(rawPath, join(coverDir, outPath))
       const converted = await readFile(cached)
       return sendJpeg(converted)
     } catch (error) {
