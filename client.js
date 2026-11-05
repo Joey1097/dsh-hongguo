@@ -18,6 +18,27 @@ window.__ModuleLoader__.load({
     const KIND = 'hongguo'
     const NS = 'hongguo'
 
+    /**
+     * The Host's own settings. `autoPrompt` is the only one this half consumes,
+     * and it is read once per page: a documented switch that silently does
+     * nothing is worse than no switch at all.
+     */
+    const hostConfig = { autoPrompt: true, loaded: false }
+    const configWaiters = new Set()
+    function loadHostConfig() {
+      if (hostConfig.loaded) return
+      hostConfig.loaded = true
+      fetch(`${API}/config`)
+        .then((response) => (response.ok ? response.json() : undefined))
+        .then((value) => {
+          if (value && typeof value.autoPrompt === 'boolean') hostConfig.autoPrompt = value.autoPrompt
+        })
+        .catch(() => {})
+        .finally(() => {
+          for (const waiter of configWaiters) waiter()
+        })
+    }
+
     const zh = {
       'tab.title': '摸鱼短剧',
       'button.label': '短剧',
@@ -673,7 +694,7 @@ window.__ModuleLoader__.load({
           ? loadVendor('mpegts.js').then((mpegts) => {
               if (disposed) return
               const engine = mpegts.default ?? mpegts
-              if (!engine?.isSupported?.()) throw new Error(t('player.noMse'))
+              if (engine?.isSupported && !engine.isSupported()) throw new Error(t('player.noMse'))
               player = engine.createPlayer({
                 type: 'mse',
                 isLive: false,
@@ -681,16 +702,19 @@ window.__ModuleLoader__.load({
                 hasAudioTrack: true,
               }, { autoCleanupSourceBuffer: true, lazyLoad: true })
               player.attachMediaElement(video)
-              player.on(engine.Events?.ERROR ?? 'error', onMediaError)
+              player.on(engine.Events?.ERROR ?? 'error', failOnMedia)
               player.load()
             })
           : loadVendor('dash.all.min.mjs').then((dash) => {
               if (disposed) return
               const engine = dash.MediaPlayer ?? dash.default
-              if (!engine?.isSupported?.()) throw new Error(t('player.noMse'))
+              // dash.js exposes no static `isSupported`: the old guard tested an
+              // absent method, so `!undefined` was always true and DASH threw
+              // before it could attach. MSE presence is the real precondition.
+              if (typeof window.MediaSource === 'undefined') throw new Error(t('player.noMse'))
               player = engine().create()
               player.initialize(video, activeSource.url, false)
-              player.on(player.constructor.events?.ERROR ?? 'error', failOnMedia)
+              player.on(engine?.events?.ERROR ?? 'error', failOnMedia)
             })
         attach.catch((error) => {
           if (!disposed) console.error('[hongguo] player failed', error)
@@ -1339,6 +1363,18 @@ window.__ModuleLoader__.load({
      */
     /** Dock entry: the prompt, isolated so a failure there never affects the tab. */
     function DockPrompt(props) {
+      // Hooks stay unconditional; the gate is a render-time read so switching
+      // `autoPrompt` off unmounts the card without unregistering the entry.
+      const [, bump] = React.useState(0)
+      React.useEffect(() => {
+        const waiter = () => bump((count) => count + 1)
+        configWaiters.add(waiter)
+        loadHostConfig()
+        return () => {
+          configWaiters.delete(waiter)
+        }
+      }, [])
+      if (hostConfig.autoPrompt === false) return null
       return h(Area, { name: 'dock', children: h(RunningPrompt, props) })
     }
 

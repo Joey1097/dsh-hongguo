@@ -1,6 +1,6 @@
 {
   "name": "dsh-hongguo",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "摸鱼短剧：右侧边栏短剧播放器，等待 Agent 时提示调出（基于 openhongguo）",

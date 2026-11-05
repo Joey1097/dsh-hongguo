@@ -33,7 +33,7 @@
 
 ## 结构
 
-- **Host 半（`index.js`）**：加载 openhongguo SDK、维护匿名设备档案，提供同源路由 `/api/hongguo/{feed,series,play,media,stream,config,running}`、`/api/hongguo/cover` 与 `/api/hongguo/vendor`。启动时预先拉取剧集列表。CDN 只提供 HEIC 封面，Host 用 macOS 的 `sips` 转成 JPEG 并缓存。
+- **Host 半（`index.js`）**：加载 openhongguo SDK、维护匿名设备档案，提供同源路由 `/api/hongguo/{feed,series,play,media,stream,playlist,config,running,activity}`、`/api/hongguo/cover` 与 `/api/hongguo/vendor`。启动时预先拉取剧集列表。CDN 只提供 HEIC 封面，Host 用 macOS 的 `sips` 转成 JPEG 并缓存。
 - **Client 半（`client.js`）**：注册侧边栏标签页类型 `hongguo`、侧栏底部按钮，以及 `conversation.input.dock` 里的等待提示。
 
 ## 播放与解密
@@ -49,6 +49,29 @@
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `autoPrompt` | `true` | Agent 运行时是否显示提示 |
-| `panelWidth` | `480` | 播放器标签页的默认宽度（px） |
+| `panelWidth` | `480` | 保留字段：右侧边栏宽度由 DSH 自己管理，当前版本不生效 |
 | `profilePath` | 插件数据目录 | 匿名设备档案文件；删除即更换设备 |
 | `searchTerms` | `总裁/重生/逆袭` | 推荐不足时补充列表用的搜索词 |
+
+## 本 fork 的改动
+
+在 `frostming/dsh-hongguo` 基础上的加固与修复：
+
+**安全**
+
+- `/api/hongguo/*` 是绕过 DSH 认证 `/api` 桥的裸前缀路由，现在要求 `Host` 头指向本机服务本身（含 `127.0.0.1` / `localhost` / `[::1]` 别名）。DNS rebinding 的页面无法伪造该头。
+- `/stream` 不再回 `Access-Control-Allow-Origin: *`；转发上游 `Content-Type` 前先过滤，非媒体类型一律降级为 `application/octet-stream` 并加 `Content-Disposition: attachment`，同时补 `X-Content-Type-Options: nosniff`，避免把 CDN 内容当同源文档执行。
+- `/stream`、`/cover`、HLS/DASH 子清单、以及解密下载都重新校验跳转后的域名，不再只信任第一个 URL 的白名单结论。
+- `/config` 不再返回 `profilePath` 绝对路径。
+- `sips` 增加 15s 超时；封面缓存上限 300 张；ffmpeg 并发上限 2。
+
+**功能修复**
+
+- `/playlist` 修复：缓存里存的是 `{body,type}`，旧代码读 `entry.url` 导致每次必失败。
+- `.mjs` 按 `text/javascript` 返回：Chromium 拒绝非 JS MIME 的动态 `import()`，DASH 因此永远加载不了。
+- HLS 分支引用了未定义的 `onMediaError`，改为已有的 `failOnMedia`；DASH 用不存在的 `MediaPlayer.isSupported` 做前置检查，改为判断 `MediaSource` 是否存在。
+- `autoPrompt` 现在真的生效（客户端读取 `/config` 后决定是否渲染等待提示）。
+- 新增 `POST /api/hongguo/activity`，客户端的上报不再 404。
+- 数据目录支持 `$DSH_HOME`（原先硬编码 `~/.dsh`）。
+
+已知限制：`panelWidth` 无公开 API 可设（侧边栏自己管宽度）；`/media`、`/stream` 等路由本身仍需登录校验，仅靠 Host 头与 loopback 绑定防护，请勿把 DSH 暴露到局域网或反代出去。

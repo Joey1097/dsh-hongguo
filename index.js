@@ -118,14 +118,19 @@ export function apply(ctx, config = {}) {
   let resolved
   const ready = settings.then((value) => (resolved = value))
   const readConfig = () => ({ autoPrompt: true, panelWidth: 480, searchTerms: ['总裁', '重生', '逆袭'], ...(resolved ?? config) })
+  // `$DSH_PLUGIN_DATA_DIR` is the exact data root when the Host supplies one;
+  // otherwise follow `$DSH_HOME`, and only then fall back to `~/.dsh`.
+  const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
   const dataDir = process.env.DSH_PLUGIN_DATA_DIR
     ? join(process.env.DSH_PLUGIN_DATA_DIR, 'dsh-hongguo')
-    : join(homedir(), '.dsh', 'plugin-data', 'dsh-hongguo')
+    : join(dshHome, 'plugin-data', 'dsh-hongguo')
   let profilePath = typeof config.profilePath === 'string' && config.profilePath ? config.profilePath : join(dataDir, 'anonymous.json')
 
   let clientPromise
   let games = []
   let gamesAt = 0
+  /** Last state the player beaconed, kept for Host-side surfaces. */
+  let lastActivity
 
   const logger = ctx.logger ?? { info() {}, warn() {}, error() {} }
   const VENDOR_DIR = join(dirname(fileURLToPath(import.meta.url)), 'vendor')
@@ -187,6 +192,25 @@ export function apply(ctx, config = {}) {
   const ffmpegBin = ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg'].find((path) => existsSync(path)) ?? 'ffmpeg'
   const runFfmpeg = promisify(execFile).bind(null, ffmpegBin)
 
+  /**
+   * Bound concurrent transcodes. Every undecrypted episode would otherwise be
+   * free to start its own ffmpeg, and the media route is reachable without a
+   * login, so a burst of requests could fork one process per request.
+   */
+  const FFMPEG_LIMIT = 2
+  const ffmpegQueue = []
+  let ffmpegActive = 0
+  async function withFfmpegSlot(work) {
+    if (ffmpegActive >= FFMPEG_LIMIT) await new Promise((resolve) => ffmpegQueue.push(resolve))
+    ffmpegActive += 1
+    try {
+      return await work()
+    } finally {
+      ffmpegActive -= 1
+      ffmpegQueue.shift()?.()
+    }
+  }
+
   function safeId(id) {
     return /^[0-9A-Za-z_-]{1,64}$/.test(String(id ?? '')) ? String(id) : undefined
   }
@@ -198,6 +222,20 @@ export function apply(ctx, config = {}) {
       const rows = await Promise.all(names.map(async (name) => ({ name, at: (await stat(join(mediaDir, name))).mtimeMs })))
       rows.sort((a, b) => b.at - a.at)
       await Promise.all(rows.slice(MEDIA_KEEP).map((row) => rm(join(mediaDir, row.name), { force: true })))
+    } catch {
+      // Pruning is housekeeping only.
+    }
+  }
+
+  /** Keep the cover cache bounded: a poster is cheap to rebuild on demand. */
+  const COVER_KEEP = 300
+  async function pruneCovers() {
+    try {
+      const names = (await readdir(coverDir)).filter((name) => name.endsWith('.jpg'))
+      if (names.length <= COVER_KEEP) return
+      const rows = await Promise.all(names.map(async (name) => ({ name, at: (await stat(join(coverDir, name))).mtimeMs })))
+      rows.sort((a, b) => b.at - a.at)
+      await Promise.all(rows.slice(COVER_KEEP).map((row) => rm(join(coverDir, row.name), { force: true })))
     } catch {
       // Pruning is housekeeping only.
     }
@@ -228,12 +266,19 @@ export function apply(ctx, config = {}) {
       const encrypted = join(mediaDir, `${episodeId}.part.enc`)
       const partial = join(mediaDir, `${episodeId}.part.mp4`)
       try {
-        const upstream = await fetch(entry.url, { signal: AbortSignal.timeout(60_000) })
+        // The play model comes from the SDK, not from this process: validate
+        // the host before downloading it, exactly like the stream proxy does.
+        if (!allowedHost(new URL(entry.url).hostname)) {
+          throw new Error(`unsupported stream host: ${new URL(entry.url).hostname}`)
+        }
+        const upstream = await fetch(entry.url, { redirect: 'follow', signal: AbortSignal.timeout(60_000) })
         if (!upstream.ok) throw new Error(`CDN HTTP ${upstream.status}`)
         await writeFile(encrypted, Buffer.from(await upstream.arrayBuffer()))
-        await runFfmpeg(
-          ['-v', 'error', '-y', '-decryption_key', entry.key, '-i', encrypted, '-map', '0', '-c', 'copy', '-tag:v', 'hvc1', '-movflags', '+faststart', partial],
-          { timeout: 120_000 },
+        await withFfmpegSlot(() =>
+          runFfmpeg(
+            ['-v', 'error', '-y', '-decryption_key', entry.key, '-i', encrypted, '-map', '0', '-c', 'copy', '-tag:v', 'hvc1', '-movflags', '+faststart', partial],
+            { timeout: 120_000 },
+          ),
         )
         await rename(partial, out)
       } finally {
@@ -344,8 +389,16 @@ export function apply(ctx, config = {}) {
    */
   async function serveManifest(access) {
     const fetchText = async (target) => {
-      const fetched = await fetch(target, { signal: AbortSignal.timeout(30_000) })
+      const requested = new URL(target)
+      if (!allowedHost(requested.hostname)) throw new Error(`manifest host not allowed: ${requested.hostname}`)
+      const fetched = await fetch(requested.href, { redirect: 'follow', signal: AbortSignal.timeout(30_000) })
       if (!fetched.ok) throw new Error(`manifest ${fetched.status}`)
+      // The child playlist and any redirect are separate hops: re-check them
+      // instead of trusting the first URL's allowlist verdict.
+      if (fetched.url && !allowedHost(new URL(fetched.url).hostname)) {
+        fetched.body?.cancel().catch(() => {})
+        throw new Error(`manifest redirect host not allowed: ${new URL(fetched.url).hostname}`)
+      }
       return { text: await fetched.text(), type: fetched.headers.get('content-type') ?? '' }
     }
     let { text, type } = await fetchText(access.absolute)
@@ -368,12 +421,16 @@ export function apply(ctx, config = {}) {
     return { body: rewritten, type: contentType }
   }
 
-  /** Rewrite one HLS/DASH manifest delivered under an older signature. */
+  /**
+   * Rewrite one HLS/DASH manifest delivered under an older signature.
+   *
+   * The cache already holds the rewritten body; re-fetching the upstream here
+   * used to read `entry.url`, a field this cache never stored, so `/playlist`
+   * threw on every call.
+   */
   async function playbackManifest() {
     for (const entry of [...manifestCache.values()].reverse()) {
-      const served = await fetch(entry.url, { signal: AbortSignal.timeout(30_000) })
-      if (!served.ok) continue
-      return { ...(await serveManifest({ absolute: entry.url })) }
+      if (entry?.body) return { body: entry.body, type: entry.type }
     }
     throw Object.assign(new Error('没有可用的播放列表'), { status: 404 })
   }
@@ -390,32 +447,41 @@ export function apply(ctx, config = {}) {
    */
   async function serveCover(request, response, url) {
     const source = url.searchParams.get('u') ?? ''
+    /** CDN hosts that may serve a poster. */
+    const coverHost = (hostname) => /(^|\.)(fqnovelpic\.com|byteimg\.com|pstatp\.com|snssdk\.com|bytecdn\.cn)$/.test(hostname)
     let target
     try {
       target = new URL(source)
     } catch {
       target = undefined
     }
-    if (!target || !/^https?:$/.test(target.protocol) || !/(^|\.)(fqnovelpic\.com|byteimg\.com|pstatp\.com|snssdk\.com|bytecdn\.cn)$/.test(target.hostname)) {
+    if (!target || !/^https?:$/.test(target.protocol) || !coverHost(target.hostname)) {
       response.statusCode = 400
       return response.end()
     }
     const key = createHash('sha1').update(target.href).digest('hex')
     const cached = join(coverDir, `${key}.jpg`)
-    const sendJpeg = (bytes) => {
+    const sendImage = (bytes, type = 'image/jpeg') => {
       response.statusCode = 200
-      response.setHeader('content-type', 'image/jpeg')
+      response.setHeader('content-type', type)
+      response.setHeader('x-content-type-options', 'nosniff')
       response.setHeader('cache-control', 'public, max-age=86400')
       response.end(request.method === 'HEAD' ? undefined : bytes)
     }
     try {
-      return sendJpeg(await readFile(cached))
+      return sendImage(await readFile(cached))
     } catch {
       // Not converted yet.
     }
     let upstream
     try {
-      upstream = await fetch(target.href, { signal: AbortSignal.timeout(20_000) })
+      upstream = await fetch(target.href, { redirect: 'follow', signal: AbortSignal.timeout(20_000) })
+      // A redirect must not carry the allowlist somewhere else.
+      if (upstream.url && !coverHost(new URL(upstream.url).hostname)) {
+        upstream.body?.cancel().catch(() => {})
+        response.statusCode = 403
+        return response.end()
+      }
     } catch {
       response.statusCode = 502
       return response.end()
@@ -426,16 +492,24 @@ export function apply(ctx, config = {}) {
     }
     const type = upstream.headers.get('content-type') ?? ''
     const bytes = Buffer.from(await upstream.arrayBuffer())
-    if (/^image\/(jpeg|png|webp|gif|avif)/.test(type)) return sendJpeg(bytes)
+    // Already browser-safe: hand it back under its real type, uncached.
+    const safe = /^image\/(jpeg|png|webp|gif|avif)/.exec(type)
+    if (safe) return sendImage(bytes, `image/${safe[1]}`)
     // HEIC and everything else local ImageIO understands goes through sips.
     const rawPath = join(coverDir, `${key}.heic`)
     const outPath = `${key}.jpg`
     try {
       await mkdir(coverDir, { recursive: true, mode: 0o700 })
       await writeFile(rawPath, bytes)
-      await sips(['-s', 'format', 'jpeg', '-s', 'formatOptions', '70', '--resampleWidth', '240', rawPath, '--out', join(coverDir, outPath)])
+      // `sips` gets a bound like ffmpeg: a malformed image must not pin the
+      // conversion forever, and this route needs no login to reach.
+      await sips(
+        ['-s', 'format', 'jpeg', '-s', 'formatOptions', '70', '--resampleWidth', '240', rawPath, '--out', join(coverDir, outPath)],
+        { timeout: 15_000 },
+      )
       const converted = await readFile(cached)
-      return sendJpeg(converted)
+      pruneCovers()
+      return sendImage(converted)
     } catch (error) {
       logger.warn?.(`[hongguo] cover conversion failed: ${error?.message ?? error}`)
       response.statusCode = 415
@@ -458,7 +532,11 @@ export function apply(ctx, config = {}) {
     try {
       const bytes = await readFile(join(VENDOR_DIR, name))
       response.statusCode = 200
-      response.setHeader('content-type', name.endsWith('.js') ? 'text/javascript; charset=utf-8' : 'application/octet-stream')
+      // `.mjs` is a module script: Chromium refuses a dynamic `import()` whose
+      // response is not a JavaScript MIME type, so both spellings must say so.
+      const isJavaScript = /\.m?js$/.test(name)
+      response.setHeader('content-type', isJavaScript ? 'text/javascript; charset=utf-8' : 'application/octet-stream')
+      response.setHeader('x-content-type-options', 'nosniff')
       response.setHeader('cache-control', 'public, max-age=86400')
       response.end(request.method === 'HEAD' ? undefined : bytes)
     } catch {
@@ -619,6 +697,12 @@ export function apply(ctx, config = {}) {
       } catch (error) {
         return send(502, { ok: false, error: { message: String(error?.message ?? error) } })
       }
+      // The allowlist verdict was made for the requested URL; a redirect is a
+      // different host and must earn its own.
+      if (upstreamResponse.url && !allowedHost(new URL(upstreamResponse.url).hostname)) {
+        upstreamResponse.body?.cancel().catch(() => {})
+        return send(403, { ok: false, error: { message: 'redirect host not allowed' } })
+      }
       const type = upstreamResponse.headers.get('content-type') ?? ''
       const isManifest =
         /mpegurl|dash\+xml/.test(type) ||
@@ -633,12 +717,21 @@ export function apply(ctx, config = {}) {
         return
       }
       response.statusCode = upstreamResponse.status
-      for (const header of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'last-modified']) {
+      for (const header of ['content-length', 'content-range', 'accept-ranges', 'last-modified']) {
         const value = upstreamResponse.headers.get(header)
         if (value) response.setHeader(header, value)
       }
+      // A proxied CDN reply is data, never a document. Forward the upstream
+      // type only when it is a media type, force a download otherwise, and
+      // stop the browser from second-guessing either decision. No CORS header:
+      // every legitimate caller is this same origin.
+      const servedType = /^(?:video|audio)\/|^application\/(?:octet-stream|mp4)$/.test(type)
+        ? type
+        : 'application/octet-stream'
+      response.setHeader('content-type', servedType)
+      response.setHeader('x-content-type-options', 'nosniff')
+      if (servedType === 'application/octet-stream') response.setHeader('content-disposition', 'attachment')
       response.setHeader('cache-control', 'public, max-age=3600')
-      response.setHeader('access-control-allow-origin', '*')
       if (!upstreamResponse.body || request.method === 'HEAD') {
         response.end()
         return
@@ -662,8 +755,31 @@ export function apply(ctx, config = {}) {
     if (path === '/config') {
       return json(async () => {
         const current = readConfig()
-        return { autoPrompt: current.autoPrompt, panelWidth: current.panelWidth, searchTerms: current.searchTerms, profilePath }
+        // No absolute filesystem path: this route needs no login.
+        return { autoPrompt: current.autoPrompt, panelWidth: current.panelWidth, searchTerms: current.searchTerms }
       })
+    }
+
+    if (path === '/activity') {
+      if (request.method !== 'POST') return send(405, { ok: false, error: { message: 'method not allowed' } })
+      // The player reports what it is showing. Nothing reads it back yet, but
+      // answering the beacon is cheaper than the 404 it used to earn.
+      let body = ''
+      for await (const chunk of request) {
+        body += chunk
+        if (body.length > 4096) {
+          body = ''
+          break
+        }
+      }
+      let value
+      try {
+        value = JSON.parse(body || '{}')
+      } catch {
+        value = undefined
+      }
+      lastActivity = { at: Date.now(), ...(value && typeof value === 'object' ? value : {}) }
+      return send(200, { ok: true })
     }
 
     if (path === '/running') {
@@ -772,12 +888,43 @@ export function apply(ctx, config = {}) {
 
   // The Web server is optional in non-web profiles; everything else still works.
   ctx.inject(['webServer'], (web) => {
-    const guard = (fn) => (request, response) =>
-      Promise.resolve(fn(request, response)).catch((error) => {
+    /**
+     * These routes are registered as raw prefixes, so they sit in front of the
+     * authenticated `/api` bridge and answer without a session cookie. A
+     * DNS-rebound page reaches 127.0.0.1 under its own hostname, so requiring
+     * the Host header to name this server keeps it out; a page that can only
+     * send its own Host cannot be same-origin with the loopback address.
+     */
+    const allowedHosts = (() => {
+      const hosts = new Set()
+      try {
+        const origin = new URL(web.webServer.getOrigin())
+        hosts.add(origin.host.toLowerCase())
+        if ((origin.hostname === '127.0.0.1' || origin.hostname === 'localhost' || origin.hostname === '[::1]') && origin.port) {
+          for (const name of ['127.0.0.1', 'localhost', '[::1]']) hosts.add(`${name}:${origin.port}`)
+        }
+      } catch {
+        // No usable origin: leave the routes open rather than lock them out.
+      }
+      return hosts
+    })()
+    const hostAllowed = (request) => {
+      if (allowedHosts.size === 0) return true
+      return allowedHosts.has(String(request.headers.host ?? '').toLowerCase())
+    }
+    const guard = (fn) => (request, response) => {
+      if (!hostAllowed(request)) {
+        response.statusCode = 403
+        response.setHeader('content-type', 'text/plain; charset=utf-8')
+        response.end('forbidden host')
+        return Promise.resolve()
+      }
+      return Promise.resolve(fn(request, response)).catch((error) => {
         logger.warn?.(`[hongguo] route error: ${error?.stack ?? error}`)
         if (!response.headersSent) response.statusCode = 500
         response.end()
       })
+    }
     const data = guard((request, response) =>
       handleHttp(request, response, new URL(request.url, `http://${request.headers.host ?? 'localhost'}`)),
     )
