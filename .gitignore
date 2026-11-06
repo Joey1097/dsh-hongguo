@@ -5,3 +5,4 @@ node_modules/
 work/
 downloads/
 profile.json
+package-lock.json

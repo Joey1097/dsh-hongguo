@@ -17,11 +17,16 @@ window.__ModuleLoader__.load({
     const TAB_ID = 'dsh-hongguo'
     const KIND = 'hongguo'
     const NS = 'hongguo'
+    /** Playback rates offered in the player's speed picker. */
+    const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2]
 
     const zh = {
       'tab.title': '摸鱼短剧',
       'button.label': '短剧',
       'button.tooltip': '打开摸鱼短剧',
+      'window.browser': '默认浏览器打开',
+      'window.browserTip': '交给系统默认浏览器打开；通常是在已有窗口里开成标签页',
+      'player.pip': '画中画',
       'guide.title': '摸鱼短剧',
       'guide.description': '在边栏里看一部短剧，陪 Agent 一起干活',
       'prompt.title': 'Agent 干活中，刷一集？',
@@ -80,6 +85,9 @@ window.__ModuleLoader__.load({
       'tab.title': 'Drama Break',
       'button.label': 'Drama',
       'button.tooltip': 'Open Drama Break',
+      'window.browser': 'Open in browser',
+      'window.browserTip': 'Hand it to the default browser, which usually opens a tab',
+      'player.pip': 'Picture in picture',
       'guide.title': 'Drama Break',
       'guide.description': 'Watch a short drama beside the Agent while it works',
       'prompt.title': 'Agent working — squeeze in an episode?',
@@ -237,6 +245,13 @@ window.__ModuleLoader__.load({
 .hg-ctl{appearance:none;border:0;background:none;color:#fff;height:28px;min-width:28px;padding:0 6px;border-radius:6px;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;font:inherit;font-size:11px;}
 .hg-ctl:hover{background:rgba(255,255,255,.16);}
 .hg-ctl[disabled]{opacity:.4;cursor:default;}
+.hg-ctl.hg-rate{min-width:auto;padding:0 4px;font-variant-numeric:tabular-nums;background:rgba(0,0,0,.3);}
+.hg-ctl.hg-rate option{color:#111;background:#fff;}
+/* The volume level, shown on the picture for a moment after a wheel turn. */
+.hg-vol{position:absolute;left:50%;top:14%;transform:translateX(-50%);display:flex;align-items:center;gap:8px;padding:7px 12px;border-radius:999px;background:rgba(0,0,0,.66);color:#fff;font-size:12px;pointer-events:none;z-index:3;}
+.hg-vol-bar{width:76px;height:4px;border-radius:999px;background:rgba(255,255,255,.3);overflow:hidden;}
+.hg-vol-bar span{display:block;height:100%;background:#fff;}
+.hg-vol-num{font-variant-numeric:tabular-nums;min-width:34px;text-align:right;}
 .hg-time{font-size:11px;font-variant-numeric:tabular-nums;opacity:.9;margin-left:4px;white-space:nowrap;}
 .hg-spacer{flex:1;}
 .hg-seek{-webkit-appearance:none;appearance:none;width:100%;height:14px;background:transparent;cursor:pointer;margin:0;}
@@ -299,6 +314,9 @@ window.__ModuleLoader__.load({
         muted: 'M4 9.5h3.5L12 5.5v13l-4.5-4H4zM16 9.5l5 5M21 9.5l-5 5',
         fullscreen: 'M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5',
         history: 'M4 12a8 8 0 102.3-5.6M4 4v4h4M12 8v4.5l3 2',
+        // Two frames: the one inside is the floating picture.
+        pip: 'M3 5h18v14H3zM12 11h6v5h-6z',
+        external: 'M14 4h6v6M20 4l-8 8M18 14v5H5V6h5',
       }
       const filled = name === 'play' || name === 'pause' || name === 'next'
       return h(
@@ -494,6 +512,28 @@ window.__ModuleLoader__.load({
       return Object.values(stored.series ?? {}).sort((a, b) => (b.at ?? 0) - (a.at ?? 0))
     }
 
+    // ---- player settings ---------------------------------------------------
+    // Volume is the one setting worth carrying between pages, and the standalone
+    // window writes the same key, so both halves agree on how loud it is.
+    const VOLUME_KEY = `${HISTORY_KEY}.volume`
+
+    function readVolume() {
+      try {
+        const stored = Number(localStorage.getItem(VOLUME_KEY))
+        return Number.isFinite(stored) && stored >= 0 && stored <= 1 ? stored : 1
+      } catch {
+        return 1
+      }
+    }
+
+    function writeVolume(value) {
+      try {
+        localStorage.setItem(VOLUME_KEY, String(Math.round(value * 100) / 100))
+      } catch {
+        // A disabled storage loses only the setting.
+      }
+    }
+
     /**
      * The Sidebar tab: the player. The tab hook is read in this small wrapper
      * so a bad parameter can only reach the player it opens, and the wrapper
@@ -540,6 +580,12 @@ window.__ModuleLoader__.load({
       const [playback, setPlayback] = React.useState({ status: 'idle', data: undefined, error: undefined })
       const [quality, setQuality] = React.useState(undefined)
       const [muted, setMuted] = React.useState(true)
+      /** Volume survives a reload and is shared with the standalone window. */
+      const [volume, setVolume] = React.useState(readVolume)
+      /** The level drawn on the picture for a moment after a wheel turn. */
+      const [volumeNotice, setVolumeNotice] = React.useState(undefined)
+      const volumeRef = React.useRef(volume)
+      const volumeTimer = React.useRef(undefined)
       const [progress, setProgress] = React.useState({ time: 0, duration: 0 })
       const [playing, setPlaying] = React.useState(false)
       const [rate, setRate] = React.useState(1)
@@ -686,12 +732,13 @@ window.__ModuleLoader__.load({
         return () => video.removeEventListener('error', onError)
       }, [activeSource, failOnMedia])
 
-      // A new source replaces the element: re-apply mute and autoplay attempt,
-      // and hand HLS/DASH to an MSE pipeline instead of the src= path.
+      // A new source replaces the element: re-apply mute, volume and rate, and
+      // hand HLS/DASH to an MSE pipeline instead of the src= path.
       React.useEffect(() => {
         const video = videoRef.current
         if (!video) return
         video.muted = muted
+        video.volume = volume
         video.playbackRate = rateRef.current
         const attempt = video.play()
         if (attempt && typeof attempt.catch === 'function') attempt.catch(() => {})
@@ -699,8 +746,30 @@ window.__ModuleLoader__.load({
       }, [activeSource, retryKey])
 
       React.useEffect(() => {
-        if (videoRef.current) videoRef.current.muted = muted
-      }, [muted])
+        const video = videoRef.current
+        if (!video) return
+        video.muted = muted
+        video.volume = volume
+        volumeRef.current = volume
+      }, [muted, volume])
+
+      React.useEffect(() => () => clearTimeout(volumeTimer.current), [])
+
+      // The wheel over the picture sets the volume, and the value is remembered
+      // across pages: how loud the drama is, is a preference, not episode state.
+      // The level also shows on the picture while it settles, so a wheel turn is
+      // never silent feedback.
+      React.useEffect(() => {
+        const node = stageRef.current
+        if (!node) return undefined
+        const onWheel = (event) => {
+          event.preventDefault()
+          adjustVolume(event.deltaY < 0 ? 0.05 : -0.05)
+        }
+        node.addEventListener('wheel', onWheel, { passive: false })
+        return () => node.removeEventListener('wheel', onWheel)
+        // The stage only exists once a source is ready, so re-run when it appears.
+      }, [activeSource])
 
       React.useEffect(() => {
         const video = videoRef.current
@@ -950,6 +1019,41 @@ window.__ModuleLoader__.load({
         if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {})
         else stageEl.requestFullscreen?.().catch(() => {})
       }
+      /** Unmuting a silent player must give it something to play, not silence. */
+      const toggleMute = () => {
+        if (muted && volume === 0) {
+          setVolume(0.5)
+          writeVolume(0.5)
+        }
+        setMuted((value) => !value)
+        // Muting is a volume change too, so it says so on the picture.
+        setVolumeNotice(muted ? Math.round((volume || 0.5) * 100) : 0)
+        clearTimeout(volumeTimer.current)
+        volumeTimer.current = setTimeout(() => setVolumeNotice(undefined), 1100)
+      }
+      /** Step the volume and show it on the picture for a moment. */
+      const adjustVolume = (delta) => {
+        const next = Math.min(1, Math.max(0, Math.round((volumeRef.current + delta) * 100) / 100))
+        volumeRef.current = next
+        setVolume(next)
+        writeVolume(next)
+        if (next > 0) setMuted(false)
+        // The notice is a percentage: the state is 0–1, the label is 0–100.
+        setVolumeNotice(Math.round(next * 100))
+        clearTimeout(volumeTimer.current)
+        volumeTimer.current = setTimeout(() => setVolumeNotice(undefined), 1100)
+      }
+      const togglePip = async () => {
+        const video = videoRef.current
+        if (!video) return
+        try {
+          if (document.pictureInPictureElement) await document.exitPictureInPicture()
+          else await video.requestPictureInPicture()
+        } catch (error) {
+          console.warn('[hongguo] picture-in-picture failed:', error?.message ?? String(error))
+        }
+      }
+      const pipAvailable = typeof document !== 'undefined' && document.pictureInPictureEnabled === true
 
       const header = h(
         'div',
@@ -965,6 +1069,25 @@ window.__ModuleLoader__.load({
             ? h('div', { className: 'hg-title-sub' }, t('player.episodeOf').replace('{n}', String(current.number ?? index + 1)).replace('{total}', String(total)))
             : null,
         ),
+        series
+          ? null
+          : h('button', {
+              className: 'hg-btn',
+              type: 'button',
+              title: t('window.browserTip'),
+              onClick: () => openStandaloneWindow(undefined, undefined, 0),
+            }, t('window.browser')),
+        // The same page, handed straight to the default browser instead of a
+        // window this one spawns — the two are different on a desktop shell.
+        series
+          ? h('button', {
+              className: 'hg-icon-btn',
+              type: 'button',
+              title: t('window.browserTip'),
+              'aria-label': t('window.browserTip'),
+              onClick: () => openStandaloneWindow(series, current, progress.time),
+            }, h(Icon, { name: 'external' }))
+          : null,
         series
           ? null
           : h(
@@ -1120,11 +1243,20 @@ window.__ModuleLoader__.load({
                   h('span', { className: 'hg-time' }, formatTime(progress.time) + ' / ' + formatTime(progress.duration)),
                   h('span', { className: 'hg-spacer' }),
                   h(
-                    'button',
-                    { type: 'button', className: 'hg-ctl hg-rate', title: t('player.speed'), onClick: () => setSpeed(rate >= 2 ? 1 : rate === 1 ? 1.25 : rate === 1.25 ? 1.5 : 2) },
-                    rate === 1 ? t('player.speed') : rate + 'x',
+                    'select',
+                    {
+                      className: 'hg-ctl hg-rate',
+                      title: t('player.speed'),
+                      'aria-label': t('player.speed'),
+                      value: String(rate),
+                      onChange: (event) => setSpeed(Number(event.target.value)),
+                    },
+                    SPEEDS.map((value) => h('option', { key: value, value: String(value) }, value === 1 ? '1x' : value + 'x')),
                   ),
-                  h('button', { type: 'button', className: 'hg-ctl', 'aria-label': t(muted ? 'player.unmute' : 'player.mute'), title: t(muted ? 'player.unmute' : 'player.mute'), onClick: () => setMuted((value) => !value) }, h(Icon, { name: muted ? 'muted' : 'volume' })),
+                  h('button', { type: 'button', className: 'hg-ctl', 'aria-label': t(muted ? 'player.unmute' : 'player.mute'), title: t(muted ? 'player.unmute' : 'player.mute'), onClick: toggleMute }, h(Icon, { name: muted ? 'muted' : 'volume' })),
+                  pipAvailable
+                    ? h('button', { type: 'button', className: 'hg-ctl', title: t('player.pip'), 'aria-label': t('player.pip'), onClick: togglePip }, h(Icon, { name: 'pip' }))
+                    : null,
                   h('button', { type: 'button', className: 'hg-ctl', 'aria-label': t('player.fullscreen'), title: t('player.fullscreen'), onClick: goFullscreen }, h(Icon, { name: 'fullscreen' })),
                 ),
               ),
@@ -1184,6 +1316,15 @@ window.__ModuleLoader__.load({
               })
             : null,
           overlay,
+          volumeNotice === undefined
+            ? null
+            : h(
+                'div',
+                { className: 'hg-vol', role: 'status' },
+                h(Icon, { name: volumeNotice > 0 ? 'volume' : 'muted' }),
+                h('div', { className: 'hg-vol-bar' }, h('span', { style: { width: volumeNotice + '%' } })),
+                h('span', { className: 'hg-vol-num' }, volumeNotice + '%'),
+              ),
           playback.status === 'loading' ? h('div', { className: 'hg-veil' }, h('span', { className: 'hg-spinner' }), t('player.loading')) : null,
           resumeNotice
             ? h(
@@ -1438,6 +1579,39 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * Hand the playing drama to the page the Host serves, in the user's browser.
+     *
+     * The shell denies `window.open`, so the Host starts the browser itself; the
+     * page receives the episode and the exact second to resume from, then plays on
+     * its own and advances to the next episode by itself.
+     */
+    async function openStandaloneWindow(series, episode, position) {
+      const payload = {
+        series: series?.id,
+        episode: episode?.id,
+        at: Number.isFinite(position) && position > 0 ? Math.floor(position) : undefined,
+      }
+      try {
+        const response = await fetch(`${API}/open`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(payload),
+        })
+        // The Host builds the URL and launches the browser; nothing else to do.
+        if (response.ok) return
+        console.warn('[hongguo] the Host could not open a browser:', response.status)
+      } catch (error) {
+        console.warn('[hongguo] failed to ask the Host for a window:', error?.message ?? String(error))
+      }
+      // A session whose Host cannot start a browser keeps the page local.
+      const params = new URLSearchParams()
+      if (series?.id) params.set('series', series.id)
+      if (episode?.id) params.set('episode', episode.id)
+      if (payload.at) params.set('at', String(payload.at))
+      const search = params.toString()
+      window.open(`${API}/window${search ? `?${search}` : ''}`, 'dsh-hongguo-window', 'popup=yes,width=560,height=900')
+    }
 
     /**
      * Pause every playing drama. Called when a task finishes, so the drama

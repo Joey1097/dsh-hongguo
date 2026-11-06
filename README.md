@@ -14,6 +14,15 @@ dsh plugin add github:frostming/dsh-hongguo
 
 依赖 `openhongguo` 会从 npm 一并安装。
 
+> 本仓库是个人 fork：新增浏览器播放页、倍速选择、滚轮调音量与画中画。上游项目见 [frostming/dsh-hongguo](https://github.com/frostming/dsh-hongguo)。
+
+## 在浏览器里播放
+
+右侧边栏的标签页属于**当前这个对话**：切到别的对话，标签页会卸载，正在播的那一集也就停了。想让它一直播，就把播放交给浏览器里的播放页（Host 用 `/api/hongguo/window` 提供这个页面），它有自己的文档，切对话、换侧栏布局、刷新 DSH 都不受影响。
+
+打开方式：点播放器标题栏右侧的 ↗（列表页是 `默认浏览器打开`）。DSH 桌面外壳会拦掉页面里的 `window.open`，所以由 **Host 调用系统默认浏览器**（`POST /api/hongguo/open`，URL 由 Host 自己拼，只接受剧集 id 和播放秒数）；Host 和浏览器不在同一台机器时退回页面自己的 `window.open`。
+
+播放页具备：剧集列表、搜索、`换一批`、分集（50 集一段）、原生控件、画质切换、倍速、画中画、滚轮调音量、**一集放完自动接下一集并自己接着播**、续播（与边栏共用同一份播放记录）、以及「Agent 停下时自动暂停」。
 ## 截图
 
 **剧集列表**：顶部推荐一部没看过的热门剧，下面每页 12 部，`换一批` 翻页；`观看历史` 点开才显示。
@@ -36,16 +45,21 @@ dsh plugin add github:frostming/dsh-hongguo
 | 搜索 | 走红果接口而不是过滤已加载的列表；首屏自动补到 12 部，`换一批` 沿游标继续取，结果按 id 去重 |
 | 剧集列表 | 按面板宽度自适应：每行 6 / 4 / 3 / 2 部，每页 12 部，`换一批` 翻到下一页 |
 | 播放历史 | 记住每部剧看到第几集、第几秒；`观看历史` 按钮点开后一键续播，可单条移除 |
-| 播放器 | 画面内控制条、倍速（1–2×）、全屏、自动连播下一集、续播提示 |
 | 左侧栏底部 | `短剧` 按钮，一键打开播放器 |
 | 输入框上方 | Agent 运行时出现浮框：3 部剧可直接点开，`更多…` 打开播放器；当前页面已显示播放器时不出现 |
 | 任务完成 | Agent 从运行变为空闲时自动暂停正在播放的短剧，并在画面上提示 |
 | 侧边栏引导页 | 一个 `摸鱼短剧` 入口卡片 |
+| 播放器 | 画面内控制条、倍速选择（0.5–2×）、画中画、全屏、自动连播下一集、续播提示 |
+| 音量 | 鼠标滚轮在画面上调音量，调的时候画面里显示当前音量与进度条，数值记在浏览器里（边栏与播放页共用） |
+| 自动连播 | 一集播完自动接下一集，并且**下一集自己开播**，不用再点一下 |
+| 播放页 | 在浏览器里打开完整播放器（同样的路由与播放记录），切换对话不会打断 |
+| 画中画 | 视频级 PiP；边栏播放器和播放页里各有一个按钮 |
 
 ## 结构
 
-- **Host 半（`index.js`）**：加载 openhongguo SDK、维护匿名设备档案，提供同源路由 `/api/hongguo/{feed,series,play,search,media,stream,config,running}`、`/api/hongguo/cover` 与 `/api/hongguo/vendor`。启动时预先拉取剧集列表。CDN 只提供 HEIC 封面，Host 用 `sips`（macOS）或 `ffmpeg`（其他平台）转成 JPEG 并缓存。
-- **Client 半（`client.js`）**：注册侧边栏标签页类型 `hongguo`、侧栏底部按钮，以及 `conversation.input.dock` 里的等待提示。
+- **Host 半（`index.js`）**：加载 openhongguo SDK、维护匿名设备档案，提供同源路由 `/api/hongguo/{feed,series,play,search,media,stream,config,open,running}`、`/api/hongguo/cover`、`/api/hongguo/vendor` 与 `/api/hongguo/window`（浏览器里的播放页）。启动时预先拉取剧集列表。CDN 只提供 HEIC 封面，Host 用 `sips`（macOS）或 `ffmpeg`（其他平台）转成 JPEG 并缓存。
+- **Client 半（`client.js`）**：注册侧边栏标签页类型 `hongguo`、侧栏底部按钮、`conversation.input.dock` 里的等待提示，以及把播放交给浏览器的 ↗ 按钮。
+- **播放页（`standalone/`）**：一个不依赖 DSH React 运行时的页面（`index.html` + `app.js` + `app.css`），只调用上面那些同源路由；播放位置与音量写在与边栏相同的 localStorage 记录里，两边互通。
 
 ## 播放与解密
 
