@@ -27,6 +27,7 @@ import {
   episodeId as makeEpisodeId,
   isMediaHost,
   decryptCover,
+  imageKind,
 } from './sdk/hghub/index.js'
 
 /** 备用片源的 id。两边路由都认这个名字。 */
@@ -469,23 +470,33 @@ export function apply(ctx, config = {}) {
       response.end(request.method === 'HEAD' ? undefined : bytes)
     }
     try {
-      return sendImage(await readFile(cached))
+      const hit = await readFile(cached)
+      // An earlier build could cache raw HEIC under .jpg; drop it and convert.
+      if (imageKind(hit)) return sendImage(hit, imageKind(hit))
+      await rm(cached, { force: true })
     } catch {
       // Not converted yet.
     }
+    // The CDN drops the odd request; one retry covers it.
     let upstream
-    try {
-      upstream = await fetch(target.href, { signal: AbortSignal.timeout(20_000) })
-    } catch {
-      response.statusCode = 502
-      return response.end()
+    let bytes
+    for (let attempt = 0; attempt < 2 && !bytes; attempt += 1) {
+      try {
+        upstream = await fetch(target.href, { signal: AbortSignal.timeout(20_000) })
+        if (!upstream.ok) {
+          if (upstream.status < 500) break
+          continue
+        }
+        bytes = Buffer.from(await upstream.arrayBuffer())
+      } catch {
+        upstream = undefined
+      }
     }
-    if (!upstream.ok) {
-      response.statusCode = upstream.status
+    if (!bytes) {
+      response.statusCode = upstream && !upstream.ok ? upstream.status : 502
       return response.end()
     }
     const type = upstream.headers.get('content-type') ?? ''
-    const bytes = Buffer.from(await upstream.arrayBuffer())
     if (/^image\/(jpeg|png|webp|gif|avif)/.test(type)) return sendImage(bytes, type)
     // 备用片源（hghub）的封面是 AES-128-CBC 密文：解出来是普通 JPEG，
     // 不需要 HEIC 转换，也不依赖 ffmpeg。
@@ -493,7 +504,7 @@ export function apply(ctx, config = {}) {
       const plain = decryptCover(bytes)
       await mkdir(coverDir, { recursive: true, mode: 0o700 })
       await writeFile(cached, plain)
-      return sendImage(plain)
+      return sendImage(plain, imageKind(plain) || 'image/jpeg')
     } catch {
       // 不是这份密文，继续走下面的 HEIC 转换。
     }

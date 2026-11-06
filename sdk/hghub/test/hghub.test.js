@@ -55,6 +55,7 @@ test('imageKind 认 JPEG / PNG / GIF / WEBP / AVIF', () => {
   assert.equal(imageKind(Buffer.concat([Buffer.alloc(4), Buffer.from('ftypavif'), Buffer.alloc(4)])), 'image/avif')
   assert.equal(imageKind(Buffer.from([0x09, 0x3d, 0xe3, 0xb1, 0, 0, 0, 0, 0, 0, 0, 0])), '')
   assert.equal(imageKind(Buffer.alloc(4)), '')
+  assert.equal(imageKind(Buffer.concat([Buffer.alloc(4), Buffer.from('ftypheic'), Buffer.alloc(4)])), '', 'HEIC 不是浏览器能解的图片')
 })
 
 test('decryptCover 解开站点封面（AES-128-CBC），并放过明文', () => {

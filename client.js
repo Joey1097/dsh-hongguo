@@ -951,12 +951,20 @@ window.__ModuleLoader__.load({
      * a quiet mark stands in until (and unless) an image actually loads.
      */
     function Cover({ src, alt, big }) {
-      const [broken, setBroken] = React.useState(false)
+      // 0 = first try, 1 = one retry after a pause, 2 = give up.
+      const [tries, setTries] = React.useState(0)
+      const timer = React.useRef(undefined)
+      React.useEffect(() => () => clearTimeout(timer.current), [])
+      React.useEffect(() => setTries(0), [src])
       const glyph = h(Mark, { size: big ? 34 : 22 })
-      if (!src || broken) return h('span', { className: 'hg-cover-fallback' }, glyph)
+      if (!src || tries >= 2) return h('span', { className: 'hg-cover-fallback' }, glyph)
       // The CDN publishes HEIC; the Host converts each poster to JPEG once.
-      const proxied = `${API}/cover?u=${encodeURIComponent(src)}`
-      return h('img', { src: proxied, alt, loading: 'lazy', onError: () => setBroken(true) })
+      const proxied = `${API}/cover?u=${encodeURIComponent(src)}${tries ? '&r=1' : ''}`
+      const onError = () => {
+        if (tries > 0) return setTries(2)
+        timer.current = setTimeout(() => setTries(1), 1500)
+      }
+      return h('img', { key: tries, src: proxied, alt, loading: 'lazy', onError })
     }
 
     /**

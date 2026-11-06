@@ -119,7 +119,12 @@ export function imageKind(bytes) {
   if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png'
   if (bytes.subarray(0, 4).toString('latin1') === 'GIF8') return 'image/gif'
   if (bytes.subarray(0, 4).toString('latin1') === 'RIFF' && bytes.subarray(8, 12).toString('latin1') === 'WEBP') return 'image/webp'
-  if (bytes.subarray(4, 8).toString('latin1') === 'ftyp') return 'image/avif'
+  // ISO-BMFF images share `ftyp`; only AVIF decodes in a browser. HEIC
+  // (heic/heix/mif1…) must not pass as an image, or it skips conversion.
+  if (bytes.subarray(4, 8).toString('latin1') === 'ftyp') {
+    const brand = bytes.subarray(8, 12).toString('latin1')
+    return brand === 'avif' || brand === 'avis' ? 'image/avif' : ''
+  }
   return ''
 }
 
