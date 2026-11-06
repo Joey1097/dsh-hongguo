@@ -4,6 +4,16 @@
 
 数据来自 [openhongguo](https://github.com/beilunyang/openhongguo)（第三方短剧平台的非官方 SDK，匿名设备、无需登录）。请仅用于个人学习与研究，内容版权归权利人所有。
 
+## 安装
+
+npm 上的 `dsh-hongguo` 不是本插件，请从 GitHub 安装：
+
+```sh
+dsh plugin add github:frostming/dsh-hongguo
+```
+
+依赖 `openhongguo` 会从 npm 一并安装。
+
 ## 截图
 
 **剧集列表**：顶部推荐一部没看过的热门剧，下面每页 12 部，`换一批` 翻页；`观看历史` 点开才显示。

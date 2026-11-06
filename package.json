@@ -35,9 +35,6 @@
   "engines": {
     "node": ">=20"
   },
-  "bundleDependencies": [
-    "openhongguo"
-  ],
   "dependencies": {
     "openhongguo": "0.1.0"
   }
