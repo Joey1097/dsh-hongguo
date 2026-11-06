@@ -243,6 +243,8 @@ window.__ModuleLoader__.load({
 .hg-player{display:flex;flex-direction:column;gap:10px;margin-bottom:14px;}
 .hg-stage{position:relative;border-radius:12px;overflow:hidden;background:#000;width:100%;max-width:min(100%,calc(66vh * var(--hg-aspect,0.5625)));margin:0 auto;display:flex;align-items:center;justify-content:center;}
 .hg-stage:fullscreen{max-width:none;border-radius:0;aspect-ratio:auto;}
+.hg-parking{position:fixed;left:-10000px;top:0;width:2px;height:2px;overflow:hidden;opacity:0;pointer-events:none;}
+.hg-video-slot{width:100%;height:100%;display:flex;align-items:center;justify-content:center;}
 .hg-stage video{width:100%;height:100%;object-fit:contain;display:block;background:#000;cursor:pointer;}
 .hg-overlay{position:absolute;inset:0;pointer-events:none;}
 .hg-overlay>*{pointer-events:auto;}
@@ -567,6 +569,367 @@ window.__ModuleLoader__.load({
       }
     }
 
+    // ---- one player for every session -------------------------------------
+    // The right Sidebar keeps a separate tab per session, so a player owned by
+    // the tab would stop on every session switch. The playback state, the
+    // <video> element and its HLS/DASH engine live here instead; each tab draws
+    // the shared state and lends the element a place on screen.
+    const shared = {
+      state: {
+        source: preferredSource,
+        feed: { status: 'loading', items: [], error: undefined },
+        series: undefined,
+        seriesInfo: { status: 'idle', episodes: [], error: undefined },
+        current: undefined,
+        playback: { status: 'idle', data: undefined, error: undefined },
+        quality: undefined,
+        muted: true,
+        volume: readVolume(),
+        progress: { time: 0, duration: 0 },
+        playing: false,
+        rate: 1,
+        chunk: 0,
+        aspect: 9 / 16,
+        retryKey: 0,
+        pausedByFinish: false,
+        watched: listHistory(preferredSource),
+        resumeNotice: undefined,
+      },
+      listeners: new Set(),
+    }
+    function setShared(key, value) {
+      const previous = shared.state[key]
+      const next = typeof value === 'function' ? value(previous) : value
+      if (Object.is(next, previous)) return
+      shared.state = { ...shared.state, [key]: next }
+      for (const listener of [...shared.listeners]) listener()
+    }
+    function subscribeShared(listener) {
+      shared.listeners.add(listener)
+      return () => shared.listeners.delete(listener)
+    }
+    const sharedSetters = {}
+    /** `useState` over one shared field: every mounted tab sees the same value. */
+    function useShared(key) {
+      let value
+      if (typeof React.useSyncExternalStore === 'function') {
+        value = React.useSyncExternalStore(subscribeShared, () => shared.state[key])
+      } else {
+        const [, bump] = React.useState(0)
+        React.useEffect(() => subscribeShared(() => bump((n) => n + 1)), [])
+        value = shared.state[key]
+      }
+      sharedSetters[key] ??= (next) => setShared(key, next)
+      return [value, sharedSetters[key]]
+    }
+
+    const videoRef = { current: undefined }
+    /** The last navigation request applied, so a remounted tab does not replay it. */
+    const handledRequest = { id: undefined }
+    const rateRef = { current: 1 }
+    const volumeRef = { current: shared.state.volume }
+    // The position the next episode starts from, and whether it continues an
+    // earlier viewing (shown as a notice once the seek settles).
+    const resumeRef = { current: { position: 0, resumed: false } }
+    const lastSavedRef = { current: 0 }
+
+    /** Off-screen home for the element while no tab shows it; it stays in the document so it keeps playing. */
+    let parking
+    function parkingLot() {
+      if (!parking || !parking.isConnected) {
+        parking = document.createElement('div')
+        parking.className = 'hg-parking'
+        parking.setAttribute('aria-hidden', 'true')
+        document.body.append(parking)
+      }
+      return parking
+    }
+
+    function sharedActiveSource() {
+      const { playback, quality } = shared.state
+      if (!playback.data?.sources?.length) return undefined
+      return playback.data.sources.find((source) => source.definition === quality) ?? playback.data.sources[0]
+    }
+
+    function sharedNextEpisode() {
+      const { current, seriesInfo } = shared.state
+      const at = current ? seriesInfo.episodes.findIndex((episode) => episode.id === current.id) : -1
+      return at >= 0 ? seriesInfo.episodes[at + 1] : undefined
+    }
+
+    /** Media failures are reported by whichever engine is attached. */
+    function failOnMedia() {
+      setShared('playback', (previous) =>
+        previous.status === 'ready' ? { status: 'error', data: previous.data, error: { message: '播放失败' } } : previous,
+      )
+    }
+
+    /**
+     * Load one episode's play model and start it, optionally at a position
+     * remembered from an earlier viewing.
+     */
+    function playEpisodeShared(episode, resumeAt = 0) {
+      const { series, source } = shared.state
+      const record = listHistory(source).find((row) => row.seriesId === series?.id)
+      const position = episode.id === record?.episodeId ? Math.max(resumeAt, Number(record.position) || 0) : resumeAt
+      resumeRef.current = { position: Math.max(0, Number(position) || 0), resumed: position > 0 }
+      lastSavedRef.current = 0
+      setShared('current', { id: episode.id, number: episode.number })
+      setShared('playback', { status: 'loading', data: undefined, error: undefined })
+      setShared('progress', { time: 0, duration: 0 })
+      fetchPlayback(episode.id, series?.id, source)
+        .then((data) => {
+          // A later pick has already replaced this one.
+          if (shared.state.current?.id !== episode.id) return
+          setShared('playback', { status: 'ready', data, error: undefined })
+          setShared('quality', undefined)
+        })
+        .catch((error) => {
+          if (shared.state.current?.id === episode.id) setShared('playback', { status: 'error', data: undefined, error })
+        })
+    }
+
+    function togglePlayShared() {
+      const video = videoRef.current
+      if (!video) return
+      if (video.paused) {
+        setShared('pausedByFinish', false)
+        video.play().catch(() => {})
+      } else video.pause()
+    }
+
+    function ensureVideo() {
+      if (videoRef.current) return videoRef.current
+      const video = document.createElement('video')
+      video.playsInline = true
+      video.preload = 'metadata'
+      video.addEventListener('click', togglePlayShared)
+      video.addEventListener('play', () => setShared('playing', true))
+      video.addEventListener('pause', () => setShared('playing', false))
+      video.addEventListener('timeupdate', () => {
+        const { series, current, source } = shared.state
+        setShared('progress', { time: video.currentTime, duration: video.duration })
+        // Persist about once per second, not on every tick.
+        if (current && Math.abs(video.currentTime - lastSavedRef.current) >= 1) {
+          lastSavedRef.current = video.currentTime
+          saveProgress(series, current, video.currentTime, source)
+        }
+      })
+      video.addEventListener('loadedmetadata', () => {
+        video.playbackRate = rateRef.current
+        if (video.videoWidth && video.videoHeight) setShared('aspect', video.videoWidth / video.videoHeight)
+        const { position, resumed } = resumeRef.current
+        // Resume only within the episode; near the end, start over.
+        if (position > 0 && (!video.duration || position < video.duration - END_MARGIN)) {
+          try {
+            video.currentTime = position
+          } catch {
+            // Not seekable yet; the element starts from the beginning.
+          }
+          if (resumed) setShared('resumeNotice', { from: position, duration: video.duration })
+        }
+        resumeRef.current = { position: 0, resumed: false }
+        setShared('progress', { time: position, duration: video.duration })
+      })
+      video.addEventListener('ended', () => {
+        // Only a real end of playback advances.
+        if (video.duration && video.currentTime < video.duration - 1) return
+        const { series, current, source } = shared.state
+        if (current) saveProgress(series, current, video.duration ?? 0, source)
+        const next = sharedNextEpisode()
+        if (next) playEpisodeShared(next)
+      })
+      video.addEventListener('error', () => {
+        if (engine.key) failOnMedia()
+      })
+      videoRef.current = video
+      parkingLot().append(video)
+      return video
+    }
+
+    /** The source currently attached to the element, and its MSE engine. */
+    const engine = { key: undefined, kind: undefined, player: undefined }
+    function stopEngine() {
+      const { player, kind } = engine
+      engine.key = undefined
+      engine.kind = undefined
+      engine.player = undefined
+      try {
+        if (kind === 'hls' || kind === 'hlsjs') player?.destroy()
+        else player?.reset?.()
+      } catch {
+        // A half-built player has nothing to release.
+      }
+    }
+
+    /**
+     * Point the element at the state's active source. Runs on every shared
+     * change and does nothing unless the source (or a retry) actually moved, so
+     * a tab mounting or unmounting never touches playback.
+     */
+    function syncEngine() {
+      const source = sharedActiveSource()
+      const key = source ? `${source.url}:${shared.state.retryKey}` : undefined
+      if (key === engine.key) return
+      stopEngine()
+      const video = ensureVideo()
+      if (!source) {
+        try {
+          video.pause()
+          video.removeAttribute('src')
+          video.load()
+        } catch {
+          // An element without a source has nothing to stop.
+        }
+        return
+      }
+      engine.key = key
+      engine.kind = source.kind
+      video.muted = shared.state.muted
+      video.volume = shared.state.volume
+      video.playbackRate = rateRef.current
+      if (source.kind === 'file') {
+        video.src = source.url
+      } else {
+        video.removeAttribute('src')
+        video.load()
+        const owns = () => engine.key === key
+        const attach = source.kind === 'hlsjs'
+          ? loadVendor('hls.light.min.js', 'Hls').then((hlsModule) => {
+              if (!owns()) return
+              const Hls = hlsModule?.default ?? hlsModule
+              if (!Hls?.isSupported?.()) throw new Error(translate('player.noMse'))
+              const player = new Hls({ enableWorker: false, lowLatencyMode: false })
+              engine.player = player
+              player.on(Hls.Events?.ERROR ?? 'hlsError', (event, data) => {
+                if (data?.fatal && owns()) failOnMedia()
+              })
+              player.loadSource(source.url)
+              player.attachMedia(video)
+            })
+          : source.kind === 'hls'
+            ? loadVendor('mpegts.js').then((mpegts) => {
+                if (!owns()) return
+                const mse = mpegts.default ?? mpegts
+                if (!mse?.isSupported?.()) throw new Error(translate('player.noMse'))
+                const player = mse.createPlayer({ type: 'mse', isLive: false, url: source.url, hasAudioTrack: true }, { autoCleanupSourceBuffer: true, lazyLoad: true })
+                engine.player = player
+                player.attachMediaElement(video)
+                player.on(mse.Events?.ERROR ?? 'error', () => owns() && failOnMedia())
+                player.load()
+              })
+            : loadVendor('dash.all.min.mjs').then((dash) => {
+                if (!owns()) return
+                const MediaPlayer = dash.MediaPlayer ?? dash.default
+                if (!MediaPlayer?.isSupported?.()) throw new Error(translate('player.noMse'))
+                const player = MediaPlayer().create()
+                engine.player = player
+                player.initialize(video, source.url, false)
+                player.on(player.constructor.events?.ERROR ?? 'error', () => owns() && failOnMedia())
+              })
+        attach.catch((error) => {
+          if (!owns()) return
+          console.error('[hongguo] player failed', error)
+          failOnMedia()
+        })
+      }
+      setShared('resumeNotice', undefined)
+      video.play().catch(() => {})
+    }
+
+    // ---- the element follows the visible tab ------------------------------
+    /** Mounted stage slots, most recent last; the element sits in the last one. */
+    const slotStack = []
+    function visibleSlot() {
+      return slotStack.some((host) => host.isConnected && host.getClientRects().length > 0)
+    }
+    /** The session in the foreground, as the shell records it. */
+    function foregroundSession() {
+      try {
+        return JSON.parse(localStorage.getItem('dsh.sessions.current') ?? 'null')?.sessionId
+      } catch {
+        return undefined
+      }
+    }
+    let lostTimer
+    /**
+     * The last tab showing the element went away. A session switch is handled
+     * by the follower below; anything else (the tab closed, the column
+     * collapsed) means the user put the drama away, so it stops talking.
+     */
+    function noteSlotLost(session) {
+      // Judged against the session that showed the slot: if the shell has
+      // already moved on, this unmount is a session switch, not a close.
+      clearTimeout(lostTimer)
+      lostTimer = setTimeout(() => {
+        if (slotStack.length > 0 || foregroundSession() !== session) return
+        const video = videoRef.current
+        if (video && !video.paused) video.pause()
+      }, 800)
+    }
+
+    /** Lends the shared element a place inside one tab's stage. */
+    function VideoSlot() {
+      const ref = React.useRef(null)
+      React.useLayoutEffect(() => {
+        const host = ref.current
+        const video = ensureVideo()
+        const session = foregroundSession()
+        slotStack.push(host)
+        clearTimeout(lostTimer)
+        host.append(video)
+        return () => {
+          const at = slotStack.lastIndexOf(host)
+          if (at >= 0) slotStack.splice(at, 1)
+          if (video.parentNode !== host) return
+          const next = slotStack[slotStack.length - 1]
+          if (next && next.isConnected) next.append(video)
+          else {
+            parkingLot().append(video)
+            noteSlotLost(session)
+          }
+        }
+      }, [])
+      return h('div', { ref, className: 'hg-video-slot' })
+    }
+
+    // A drama that is playing follows the user into the next session: the
+    // shell writes the foreground session on every switch, and the follower
+    // opens the drama tab there when that session is not showing one.
+    let followedSession = foregroundSession()
+    function followTick() {
+      const session = foregroundSession()
+      if (!session || session === followedSession) return
+      followedSession = session
+      const video = videoRef.current
+      if (!video || video.paused || !engine.key) return
+      setTimeout(() => {
+        if (foregroundSession() !== session || visibleSlot()) return
+        openDrama(pluginCtx)
+      }, 300)
+    }
+
+    /** Started by `apply`; its disposer releases the element and its engine. */
+    function startSharedPlayer() {
+      const timer = setInterval(followTick, 400)
+      const unsubscribe = subscribeShared(syncEngine)
+      syncEngine()
+      return () => {
+        clearInterval(timer)
+        unsubscribe()
+        clearTimeout(lostTimer)
+        stopEngine()
+        try {
+          videoRef.current?.pause()
+        } catch {
+          // Nothing to pause.
+        }
+        videoRef.current?.remove()
+        videoRef.current = undefined
+        parking?.remove()
+      }
+    }
+
     /**
      * The Sidebar tab: the player. The tab hook is read in this small wrapper
      * so a bad parameter can only reach the player it opens, and the wrapper
@@ -602,55 +965,53 @@ window.__ModuleLoader__.load({
      */
     function DramaPlayer({ requested, compact }) {
       const t = useTranslate()
-      /** 当前片源：'hongguo' 主用 / 'hghub' 备用。切换时列表和历史一起换。 */
-      const [source, setSource] = React.useState(preferredSource)
+      // Playback state is shared by every session's tab (see `shared`); only
+      // what belongs to this view of the list stays local.
+      const [source, setSource] = useShared('source')
       /** Results of the server-side search for the current query and source. */
       const [found, setFound] = React.useState({ status: 'idle', keyword: '', items: [], cursor: '', hasMore: false, loadingMore: false, error: undefined })
       const [searchTick, setSearchTick] = React.useState(0)
-      const [feed, setFeed] = React.useState({ status: 'loading', items: [], error: undefined })
+      const [feed, setFeed] = useShared('feed')
       const [query, setQuery] = React.useState('')
-      const [series, setSeries] = React.useState(undefined)
-      const [seriesInfo, setSeriesInfo] = React.useState({ status: 'idle', episodes: [], error: undefined })
-      const [current, setCurrent] = React.useState(undefined)
-      const [playback, setPlayback] = React.useState({ status: 'idle', data: undefined, error: undefined })
-      const [quality, setQuality] = React.useState(undefined)
-      const [muted, setMuted] = React.useState(true)
-      /** Volume survives a reload and is shared with the standalone window. */
-      const [volume, setVolume] = React.useState(readVolume)
+      const [series, setSeries] = useShared('series')
+      const [seriesInfo, setSeriesInfo] = useShared('seriesInfo')
+      const [current, setCurrent] = useShared('current')
+      const [playback, setPlayback] = useShared('playback')
+      const [quality, setQuality] = useShared('quality')
+      const [muted, setMuted] = useShared('muted')
+      const [volume, setVolume] = useShared('volume')
       /** The level drawn on the picture for a moment after a wheel turn. */
       const [volumeNotice, setVolumeNotice] = React.useState(undefined)
-      const volumeRef = React.useRef(volume)
       const volumeTimer = React.useRef(undefined)
-      const [progress, setProgress] = React.useState({ time: 0, duration: 0 })
-      const [playing, setPlaying] = React.useState(false)
-      const [rate, setRate] = React.useState(1)
-      const rateRef = React.useRef(1)
+      const [progress] = useShared('progress')
+      const [playing] = useShared('playing')
+      const [rate, setRate] = useShared('rate')
       const [showHistory, setShowHistory] = React.useState(false)
       /** Which page of twelve the list shows; "换一批" steps through them. */
       const [page, setPage] = React.useState(0)
-      const [chunk, setChunk] = React.useState(0)
+      const [chunk, setChunk] = useShared('chunk')
       const stageRef = React.useRef(null)
-      /** Width / height of the current video; portrait until metadata says otherwise. */
-      const [aspect, setAspect] = React.useState(9 / 16)
-      const [retryKey, setRetryKey] = React.useState(0)
-      /** Paused because the task finished; the element itself is untouched. */
-      const [pausedByFinish, setPausedByFinish] = React.useState(false)
-      const [watched, setWatched] = React.useState(() => listHistory(preferredSource))
-      const [resumeNotice, setResumeNotice] = React.useState(undefined)
-      const videoRef = React.useRef(null)
-      // The position this episode should start from, and whether it is a
-      // continuation (shown as a notice until the first seek settles).
-      const resumeRef = React.useRef({ position: 0, resumed: false })
-      const lastSavedRef = React.useRef(0)
+      const [aspect] = useShared('aspect')
+      const [, setRetryKey] = useShared('retryKey')
+      const [pausedByFinish] = useShared('pausedByFinish')
+      const [watched, setWatched] = useShared('watched')
+      const [resumeNotice, setResumeNotice] = useShared('resumeNotice')
 
       const loadFeed = React.useCallback(() => {
         setFeed((previous) => ({ ...previous, status: 'loading', error: undefined }))
         callApi(`/feed?${sourceQuery(source)}`)
-          .then((body) => setFeed({ status: 'ready', items: body.items ?? [], error: undefined }))
+          .then((body) => {
+            if (shared.state.source !== source) return
+            shared.feedFor = source
+            setFeed({ status: 'ready', items: body.items ?? [], error: undefined })
+          })
           .catch((error) => setFeed({ status: 'error', items: [], error }))
       }, [source])
 
-      React.useEffect(loadFeed, [loadFeed])
+      React.useEffect(() => {
+        if (shared.state.feed.status === 'ready' && shared.feedFor === source) return
+        loadFeed()
+      }, [loadFeed])
 
       // Enter one drama: load its episodes, then continue the episode the
       // history left unfinished (or start the first one).
@@ -680,7 +1041,9 @@ window.__ModuleLoader__.load({
       const openSeriesRef = React.useRef(openSeries)
       openSeriesRef.current = openSeries
       React.useEffect(() => {
-        if (!requestedId) return
+        if (!requestedId || handledRequest.id === requestedId) return
+        handledRequest.id = requestedId
+        if (shared.state.series?.id === requestedId) return
         openSeriesRef.current({ id: requestedId, title: typeof requested?.title === 'string' ? requested.title : undefined })
       }, [requestedId])
 
@@ -689,24 +1052,7 @@ window.__ModuleLoader__.load({
       // with the same revision is ignored.
       // Load one episode's play model and start it, optionally at a position
       // remembered from an earlier viewing.
-      const playEpisode = React.useCallback(
-        (episode, resumeAt = 0) => {
-          const record = listHistory(source).find((row) => row.seriesId === series?.id)
-          const position = episode.id === record?.episodeId ? Math.max(resumeAt, Number(record.position) || 0) : resumeAt
-          resumeRef.current = { position: Math.max(0, Number(position) || 0), resumed: position > 0 }
-          lastSavedRef.current = 0
-          setCurrent({ id: episode.id, number: episode.number })
-          setPlayback({ status: 'loading', data: undefined, error: undefined })
-          setProgress({ time: 0, duration: 0 })
-          fetchPlayback(episode.id, series?.id, source)
-            .then((data) => {
-              setPlayback({ status: 'ready', data, error: undefined })
-              setQuality(undefined)
-            })
-            .catch((error) => setPlayback({ status: 'error', data: undefined, error }))
-        },
-        [series, source],
-      )
+      const playEpisode = playEpisodeShared
       // Open routes through the current callback without re-creating it.
       /** Forget one drama's history (list row's remove control). */
       const forget = React.useCallback((seriesId) => {
@@ -765,37 +1111,7 @@ window.__ModuleLoader__.load({
         return data.sources.find((source) => source.definition === quality) ?? data.sources[0]
       }, [playback.data, quality])
 
-      // Media failures are reported by whichever player is attached.
-      const failOnMedia = React.useCallback(() => {
-        setPlayback((previous) =>
-          previous.status === 'ready'
-            ? { status: 'error', data: previous.data, error: { message: '播放失败' } }
-            : previous,
-        )
-      }, [])
 
-      // The element reports a decoding failure through its own `error`; an
-      // attached MediaSource has signalled the same through mpegts/dash.
-      React.useEffect(() => {
-        const video = videoRef.current
-        if (!video || !activeSource) return undefined
-        const onError = () => failOnMedia()
-        video.addEventListener('error', onError)
-        return () => video.removeEventListener('error', onError)
-      }, [activeSource, failOnMedia])
-
-      // A new source replaces the element: re-apply mute, volume and rate, and
-      // hand HLS/DASH to an MSE pipeline instead of the src= path.
-      React.useEffect(() => {
-        const video = videoRef.current
-        if (!video) return
-        video.muted = muted
-        video.volume = volume
-        video.playbackRate = rateRef.current
-        const attempt = video.play()
-        if (attempt && typeof attempt.catch === 'function') attempt.catch(() => {})
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-      }, [activeSource, retryKey])
 
       React.useEffect(() => {
         const video = videoRef.current
@@ -823,92 +1139,9 @@ window.__ModuleLoader__.load({
         // The stage only exists once a source is ready, so re-run when it appears.
       }, [activeSource])
 
-      React.useEffect(() => {
-        const video = videoRef.current
-        if (!video || !activeSource || activeSource.kind === 'file') return undefined
-        let player
-        let disposed = false
-        const attach = activeSource.kind === 'hlsjs'
-          ? loadVendor('hls.light.min.js', 'Hls').then((hlsModule) => {
-              if (disposed) return
-              const Hls = hlsModule?.default ?? hlsModule
-              if (!Hls?.isSupported?.()) throw new Error(t('player.noMse'))
-              player = new Hls({ enableWorker: false, lowLatencyMode: false })
-              player.on(Hls.Events?.ERROR ?? 'hlsError', (event, data) => {
-                if (data?.fatal) failOnMedia()
-              })
-              player.loadSource(activeSource.url)
-              player.attachMedia(video)
-            })
-          : activeSource.kind === 'hls'
-          ? loadVendor('mpegts.js').then((mpegts) => {
-              if (disposed) return
-              const engine = mpegts.default ?? mpegts
-              if (!engine?.isSupported?.()) throw new Error(t('player.noMse'))
-              player = engine.createPlayer({
-                type: 'mse',
-                isLive: false,
-                url: activeSource.url,
-                hasAudioTrack: true,
-              }, { autoCleanupSourceBuffer: true, lazyLoad: true })
-              player.attachMediaElement(video)
-              player.on(engine.Events?.ERROR ?? 'error', failOnMedia)
-              player.load()
-            })
-          : loadVendor('dash.all.min.mjs').then((dash) => {
-              if (disposed) return
-              const engine = dash.MediaPlayer ?? dash.default
-              if (!engine?.isSupported?.()) throw new Error(t('player.noMse'))
-              player = engine().create()
-              player.initialize(video, activeSource.url, false)
-              player.on(player.constructor.events?.ERROR ?? 'error', failOnMedia)
-            })
-        attach.catch((error) => {
-          if (disposed) return
-          console.error('[hongguo] player failed', error)
-          failOnMedia()
-        })
-        return () => {
-          disposed = true
-          try {
-            if (activeSource.kind === 'hls' || activeSource.kind === 'hlsjs') player?.destroy()
-            else player?.reset()
-          } catch {
-            // A half-built player has nothing to release.
-          }
-        }
-      }, [activeSource, retryKey, t])
 
 
-      // Publish this player's pause control while it holds a source: the task
-      // finishing pauses every place a drama can be playing.
-      React.useEffect(() => {
-        if (playback.status !== 'ready' || !activeSource) return undefined
-        const control = {
-          mine: {},
-          pause: () => {
-            const video = videoRef.current
-            try {
-              video?.pause()
-            } catch {
-              // Pausing an element without a source is harmless.
-            }
-            setPausedByFinish(true)
-          },
-        }
-        players.add(control)
-        audioOwner.current = control.mine
-        return () => {
-          players.delete(control)
-          if (audioOwner.current === control.mine) audioOwner.current = null
-        }
-      }, [playback.status, activeSource])
 
-      // Switching to a locally rewritten copy keeps the element playing, so it
-      // clears only the media-error state, not the "task finished" notice.
-      React.useEffect(() => {
-        setResumeNotice(undefined)
-      }, [activeSource])
 
       // The list's "recent" section follows the stored history on every episode.
       React.useEffect(() => {
@@ -1065,14 +1298,7 @@ window.__ModuleLoader__.load({
         setRate(value)
         if (videoRef.current) videoRef.current.playbackRate = value
       }
-      const togglePlay = () => {
-        const video = videoRef.current
-        if (!video) return
-        if (video.paused) {
-          setPausedByFinish(false)
-          video.play().catch(() => {})
-        } else video.pause()
-      }
+      const togglePlay = togglePlayShared
       const seekTo = (value) => {
         const video = videoRef.current
         if (video && Number.isFinite(value)) video.currentTime = value
@@ -1343,50 +1569,7 @@ window.__ModuleLoader__.load({
             style: { aspectRatio: String(aspect), '--hg-aspect': String(aspect) },
           },
           activeSource
-            ? h('video', {
-                key: activeSource.url + ':' + retryKey,
-                ref: videoRef,
-                src: activeSource.kind === 'file' ? activeSource.url : undefined,
-                playsInline: true,
-                preload: 'metadata',
-                onClick: togglePlay,
-                onPlay: () => setPlaying(true),
-                onPause: () => setPlaying(false),
-                onTimeUpdate: (event) => {
-                  const video = event.currentTarget
-                  setProgress({ time: video.currentTime, duration: video.duration })
-                  // Persist about once per second, not on every tick.
-                  if (current && Math.abs(video.currentTime - lastSavedRef.current) >= 1) {
-                    lastSavedRef.current = video.currentTime
-                    saveProgress(series, current, video.currentTime, source)
-                  }
-                },
-                onLoadedMetadata: (event) => {
-                  const video = event.currentTarget
-                  video.playbackRate = rateRef.current
-                  if (video.videoWidth && video.videoHeight) setAspect(video.videoWidth / video.videoHeight)
-                  const { position, resumed } = resumeRef.current
-                  // Resume only within the episode; near the end, start over.
-                  if (position > 0 && (!video.duration || position < video.duration - END_MARGIN)) {
-                    try {
-                      video.currentTime = position
-                    } catch {
-                      // Not seekable yet; the element starts from the beginning.
-                    }
-                    if (resumed) setResumeNotice({ from: position, duration: video.duration })
-                  }
-                  resumeRef.current = { position: 0, resumed: false }
-                  setProgress({ time: position, duration: video.duration })
-                },
-                onEnded: (event) => {
-                  const video = event.currentTarget
-                  // Only a real end of playback advances.
-                  if (video.duration && video.currentTime < video.duration - 1) return
-                  if (current) saveProgress(series, current, video.duration ?? 0, source)
-                  if (nextEpisode) playEpisode(nextEpisode)
-                },
-                onError: failOnMedia,
-              })
+            ? h(VideoSlot)
             : null,
           overlay,
           volumeNotice === undefined
@@ -1624,10 +1807,6 @@ window.__ModuleLoader__.load({
     /** The plugin context, so component handlers reach the sidebar controller. */
     let pluginCtx
 
-    /** Live players, one control per mounted player holding a source. */
-    const players = new Set()
-    /** The player that most recently started, which owns the activity beacon. */
-    const audioOwner = { current: null }
 
     /**
      * Tell the Host which drama this page is showing. Nothing waits on it: the
@@ -1692,13 +1871,14 @@ window.__ModuleLoader__.load({
      * read; every player also shows a short notice explaining why.
      */
     function pauseAllDramas() {
-      for (const control of [...players]) {
-        try {
-          control.pause('finished')
-        } catch {
-          // A player mid-teardown has nothing to pause.
-        }
+      const video = videoRef.current
+      if (!video || video.paused) return
+      try {
+        video.pause()
+      } catch {
+        // Nothing to pause.
       }
+      setShared('pausedByFinish', true)
     }
 
     /** Foot button beside Settings: one click from anywhere into the player. */
@@ -1864,6 +2044,8 @@ window.__ModuleLoader__.load({
           document.head.append(tag)
           return () => tag.remove()
         }, 'hongguo: styles')
+
+        ctx.effect(startSharedPlayer, 'hongguo: shared player')
 
         // The tab type: a page type (no address patterns), opened by kind.
         // Tabs opened under the plugin's earlier name keep that title in each
