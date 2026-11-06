@@ -9,7 +9,7 @@
  *
  * The Client half draws the player in the right Sidebar.
  */
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { createReadStream, existsSync } from 'node:fs'
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { promisify } from 'node:util'
@@ -68,6 +68,23 @@ const ROUTE_PREFIX = '/api/hongguo'
 const COVER_PREFIX = '/api/hongguo/cover'
 /** Static route prefix for the vendored player libraries. */
 const VENDOR_PREFIX = '/api/hongguo/vendor'
+/**
+ * The standalone player window. A Sidebar tab is owned by one conversation, so
+ * switching conversations unmounts it and the drama stops; a window holds its
+ * own document and outlives that switch, a Sidebar layout change and a reload.
+ */
+const WINDOW_PREFIX = '/api/hongguo/window'
+/** The fixed files the window serves; anything else under the prefix is a 404. */
+const WINDOW_FILES = new Map([
+  ['', ['standalone/index.html', 'text/html; charset=utf-8']],
+  ['/app.js', ['standalone/app.js', 'text/javascript; charset=utf-8']],
+  ['/app.css', ['standalone/app.css', 'text/css; charset=utf-8']],
+])
+/**
+ * Only the two ids a player window needs reach the launched URL. They are
+ * interpolated into a URL the Host builds itself, never passed through whole.
+ */
+const WINDOW_ID = /^[A-Za-z0-9_-]{1,40}$/
 /** Stream kinds in preference order, by the SDK's own `hls`/`dash` flags. */
 const STREAM_PREFERENCE = ['hls', 'dash', 'file']
 
@@ -493,6 +510,66 @@ export function apply(ctx, config = {}) {
   }
 
   /**
+   * Serve the standalone player window.
+   *
+   * The page is a fixed trio of files from the package, never a caller-supplied
+   * path, so this route cannot be turned into a file reader. It talks to the same
+   * `/api/hongguo` routes the Sidebar uses: the content key stays in the Host.
+   */
+  async function serveWindow(request, response, url) {
+    const entry = WINDOW_FILES.get(url.pathname.slice(WINDOW_PREFIX.length))
+    if (!entry) {
+      response.statusCode = 404
+      response.setHeader('content-type', 'text/plain; charset=utf-8')
+      return response.end('not found')
+    }
+    try {
+      const bytes = await readFile(new URL(entry[0], import.meta.url))
+      response.statusCode = 200
+      response.setHeader('content-type', entry[1])
+      // The window must pick up a changed page on its next open.
+      response.setHeader('cache-control', 'no-cache')
+      response.end(request.method === 'HEAD' ? undefined : bytes)
+    } catch (error) {
+      response.statusCode = 500
+      response.setHeader('content-type', 'text/plain; charset=utf-8')
+      response.end(String(error?.message ?? error))
+    }
+  }
+
+
+  /**
+   * Hand the player page to the user's own browser.
+   *
+   * The DSH shell is Electron and denies `window.open`, so the page cannot open
+   * this itself; the Host runs on the same machine as the browser and starts it.
+   * The URL is always one this plugin built, with nothing echoed from the caller.
+   */
+  async function launchBrowser(target) {
+    const options = { detached: true, stdio: 'ignore' }
+    if (process.platform === 'win32') {
+      // `start` is a cmd built-in; the empty argument is the window title slot.
+      spawn('cmd', ['/c', 'start', '', target], { ...options, windowsHide: true }).unref()
+      return
+    }
+    spawn(process.platform === 'darwin' ? 'open' : 'xdg-open', [target], options).unref()
+  }
+
+  /** Read a small JSON body; a missing or malformed one reads as an empty object. */
+  async function readJsonBody(request) {
+    let raw = ''
+    for await (const chunk of request) {
+      raw += chunk
+      if (raw.length > 4096) break
+    }
+    try {
+      return JSON.parse(raw || '{}') ?? {}
+    } catch {
+      return {}
+    }
+  }
+
+  /**
    * Map one result row to one list entry. Search rows carry no cover or impact
    * figure, so the feed's own rows are used whole and the first search page is
    * used only to append dramas the feed did not list.
@@ -835,6 +912,32 @@ export function apply(ctx, config = {}) {
       })
     }
 
+    // Hand the player to the user's default browser: the shell denies window.open.
+    if (path === '/open' && request.method === 'POST') {
+      // A browser started here belongs to this machine. For a remote client that
+      // would open the window where nobody is looking, so the page keeps the
+      // job in that case and opens the window itself.
+      const remote = String(request.socket?.remoteAddress ?? '')
+      if (!/^(::1|::ffff:127\.0\.0\.1|127\.0\.0\.1)$/.test(remote)) {
+        return send(409, { ok: false, error: { message: 'remote client: open the window from the page' } })
+      }
+      return json(async () => {
+        const body = await readJsonBody(request)
+        const params = new URLSearchParams()
+        for (const key of ['series', 'episode']) {
+          const value = body?.[key]
+          if (typeof value === 'string' && WINDOW_ID.test(value)) params.set(key, value)
+        }
+        const at = Number(body?.at)
+        if (Number.isFinite(at) && at > 0) params.set('at', String(Math.floor(at)))
+        const proto = String(request.headers['x-forwarded-proto'] ?? 'http').split(',')[0].trim()
+        const host = String(request.headers.host ?? '127.0.0.1:64866')
+        const target = `${proto === 'https' ? 'https' : 'http'}://${host}${WINDOW_PREFIX}${params.toString() ? `?${params.toString()}` : ''}`
+        await launchBrowser(target)
+        return { opened: target }
+      })
+    }
+
     response.statusCode = 404
     response.end('{"ok":false,"error":{"message":"not found"}}')
   }
@@ -858,6 +961,9 @@ export function apply(ctx, config = {}) {
     const cover = guard((request, response) =>
       serveCover(request, response, new URL(request.url, `http://${request.headers.host ?? 'localhost'}`)),
     )
+    const windowed = guard((request, response) =>
+      serveWindow(request, response, new URL(request.url, `http://${request.headers.host ?? 'localhost'}`)),
+    )
     // One effect owns every route, so unloading the plugin frees them together.
     const dispose = ctx.effect(
       () => {
@@ -865,6 +971,9 @@ export function apply(ctx, config = {}) {
           web.webServer.register({ kind: 'prefix', path: ROUTE_PREFIX, handler: data }),
           web.webServer.register({ kind: 'prefix', path: VENDOR_PREFIX, handler: vendor }),
           web.webServer.register({ kind: 'prefix', path: COVER_PREFIX, handler: cover }),
+          // Before the API prefix in intent, though the router prefers the
+          // longest match: `/api/hongguo/window` is its own document.
+          web.webServer.register({ kind: 'prefix', path: WINDOW_PREFIX, handler: windowed }),
         ]
         return () => stops.forEach((stop) => stop())
       },
