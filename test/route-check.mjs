@@ -158,9 +158,10 @@ check('every prefix is behind the Host guard, including the newer routes', async
   // covered by construction; assert it for the alternate-source routes too.
   for (const path of [
     '/api/hongguo/search?keyword=x',
-    '/api/hongguo/hg2-manifest?u=https%3A%2F%2Fexample.com%2Fx.m3u8',
+    '/api/hongguo/hghub-manifest?episode=x',
     '/api/hongguo/cover?u=https%3A%2F%2Fexample.com%2Fx.jpg',
     '/api/hongguo/vendor/mpegts.js',
+    '/api/hongguo/window',
   ]) {
     const res = await hit(path, { host: 'attacker.example:62408' })
     assert.equal(res.statusCode, 403, `${path} should be guarded`)

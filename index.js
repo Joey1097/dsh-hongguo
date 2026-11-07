@@ -9,7 +9,7 @@
  *
  * The Client half draws the player in the right Sidebar.
  */
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { createReadStream, existsSync } from 'node:fs'
 import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { promisify } from 'node:util'
@@ -18,7 +18,20 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
 import { createClient } from 'openhongguo'
-import { Client as Hg2Client } from './sdk/hg2/index.js'
+import {
+  createClient as createHgClient,
+  fetchMirrors,
+  probeLines,
+  HGHUB_LINES,
+  parseEpisodeId,
+  episodeId as makeEpisodeId,
+  isMediaHost,
+  decryptCover,
+  imageKind,
+} from './sdk/hghub/index.js'
+
+/** 备用片源的 id。两边路由都认这个名字。 */
+const HGHUB_SOURCE = 'hghub'
 
 export const name = 'dsh-hongguo'
 
@@ -31,6 +44,7 @@ function configSchema(z, DEFAULTS) {
   return z.object({
     autoPrompt: z.boolean().default(DEFAULTS.autoPrompt),
     panelWidth: z.number().step(1).min(320).max(960).default(DEFAULTS.panelWidth),
+    source: z.union(['hongguo', 'hghub']).default(DEFAULTS.source),
     profilePath: z.string(),
     searchTerms: z.array(z.string()).default(DEFAULTS.searchTerms),
   })
@@ -42,9 +56,9 @@ function configSchema(z, DEFAULTS) {
  * the wrong type falls back to the default instead of failing activation.
  */
 export async function reflectConfig(raw = {}) {
-  const DEFAULTS = { autoPrompt: true, panelWidth: 480, searchTerms: ['总裁', '重生', '逆袭'] }
+  const DEFAULTS = { autoPrompt: true, panelWidth: 480, source: 'hongguo', searchTerms: ['总裁', '重生', '逆袭'] }
   const input = Object.fromEntries(
-    Object.entries(raw ?? {}).filter(([key]) => ['autoPrompt', 'panelWidth', 'profilePath', 'searchTerms'].includes(key)),
+    Object.entries(raw ?? {}).filter(([key]) => ['autoPrompt', 'panelWidth', 'source', 'profilePath', 'searchTerms'].includes(key)),
   )
   let value
   try {
@@ -56,6 +70,7 @@ export async function reflectConfig(raw = {}) {
     value = { ...DEFAULTS }
     if (typeof input.autoPrompt === 'boolean') value.autoPrompt = input.autoPrompt
     if (Number.isFinite(input.panelWidth)) value.panelWidth = Math.min(960, Math.max(320, Math.round(input.panelWidth)))
+    if (input.source === 'hghub' || input.source === 'hongguo') value.source = input.source
     if (typeof input.profilePath === 'string') value.profilePath = input.profilePath
     if (Array.isArray(input.searchTerms)) value.searchTerms = input.searchTerms.map(String)
     if (!value.searchTerms.length) value.searchTerms = DEFAULTS.searchTerms
@@ -69,11 +84,44 @@ const ROUTE_PREFIX = '/api/hongguo'
 const COVER_PREFIX = '/api/hongguo/cover'
 /** Static route prefix for the vendored player libraries. */
 const VENDOR_PREFIX = '/api/hongguo/vendor'
+/**
+ * The standalone player window. A Sidebar tab is owned by one conversation, so
+ * switching conversations unmounts it and the drama stops; a window holds its
+ * own document and outlives that switch, a Sidebar layout change and a reload.
+ */
+const WINDOW_PREFIX = '/api/hongguo/window'
+/** The fixed files the window serves; anything else under the prefix is a 404. */
+const WINDOW_FILES = new Map([
+  ['', ['standalone/index.html', 'text/html; charset=utf-8']],
+  ['/app.js', ['standalone/app.js', 'text/javascript; charset=utf-8']],
+  ['/app.css', ['standalone/app.css', 'text/css; charset=utf-8']],
+])
+/**
+ * Only the two ids a player window needs reach the launched URL. They are
+ * interpolated into a URL the Host builds itself, never passed through whole.
+ */
+const WINDOW_ID = /^[A-Za-z0-9_-]{1,40}$/
 /** Stream kinds in preference order, by the SDK's own `hls`/`dash` flags. */
 const STREAM_PREFERENCE = ['hls', 'dash', 'file']
 
 /** Convert one image with macOS `sips` (HEIC is what the CDN publishes). */
 const sips = promisify(execFile).bind(null, 'sips')
+
+/**
+ * The CDN publishes HEIC posters, which Chromium cannot decode. macOS ships
+ * `sips`; everywhere else the ffmpeg the player already requires can decode
+ * HEIC, because libavcodec reads the HEIF still as a one-frame HEVC stream.
+ */
+function coverConverter(runFfmpeg) {
+  if (process.platform === 'darwin') {
+    return async (rawPath, outPath) => {
+      await sips(['-s', 'format', 'jpeg', '-s', 'formatOptions', '70', '--resampleWidth', '240', rawPath, '--out', outPath], { timeout: 15_000 })
+    }
+  }
+  return async (rawPath, outPath) => {
+    await runFfmpeg(['-v', 'error', '-y', '-i', rawPath, '-frames:v', '1', '-vf', 'scale=240:-2', '-q:v', '6', '-update', '1', outPath], { timeout: 30_000 })
+  }
+}
 
 /** A profile store on one JSON file, 0600 like the SDK's own file store. */
 function fileProfileStore(path) {
@@ -118,7 +166,7 @@ export function apply(ctx, config = {}) {
   const settings = reflectConfig(config)
   let resolved
   const ready = settings.then((value) => (resolved = value))
-  const readConfig = () => ({ autoPrompt: true, panelWidth: 480, searchTerms: ['总裁', '重生', '逆袭'], ...(resolved ?? config) })
+  const readConfig = () => ({ autoPrompt: true, panelWidth: 480, source: 'hongguo', searchTerms: ['总裁', '重生', '逆袭'], ...(resolved ?? config) })
   // `$DSH_PLUGIN_DATA_DIR` is the exact data root when the Host supplies one;
   // otherwise follow `$DSH_HOME`, and only then fall back to `~/.dsh`.
   const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -190,8 +238,18 @@ export function apply(ctx, config = {}) {
   const mediaKeys = new Map()
   const mediaJobs = new Map()
   const MEDIA_KEEP = 40
-  const ffmpegBin = ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg'].find((path) => existsSync(path)) ?? 'ffmpeg'
+  const ffmpegBin =
+    [
+      '/opt/homebrew/bin/ffmpeg',
+      '/usr/local/bin/ffmpeg',
+      '/usr/bin/ffmpeg',
+      // Windows: WinGet's shim directory, then a plain Program Files install;
+      // anything else (scoop, choco) is expected on PATH, which is the fallback.
+      process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Microsoft', 'WinGet', 'Links', 'ffmpeg.exe') : '',
+      process.env.ProgramFiles ? join(process.env.ProgramFiles, 'ffmpeg', 'bin', 'ffmpeg.exe') : '',
+    ].find((path) => path && existsSync(path)) ?? 'ffmpeg'
   const runFfmpeg = promisify(execFile).bind(null, ffmpegBin)
+  const convertCover = coverConverter(runFfmpeg)
 
   /**
    * Bound concurrent transcodes. Every undecrypted episode would otherwise be
@@ -338,7 +396,9 @@ export function apply(ctx, config = {}) {
 
   /** Domains the proxy is allowed to fetch. */
   function allowedHost(hostname) {
-    return /(^|\.)(qznovelvod\.com|byteimg\.com|fqnovelpic\.com|douyinvod\.com|bytecdn\.cn|ibytedtos\.com|snssdk\.com|lkkwip\.cn|6cc2n\.com|uszim\.com|cloudfront\.net)$/.test(hostname)
+    // 备用片源（hghub）的分片与 key 落在 drleao.cn / hzjvlo.cn 这类 CDN 上。
+    if (isMediaHost(hostname)) return true
+    return /(^|\.)(qznovelvod\.com|byteimg\.com|fqnovelpic\.com|douyinvod\.com|bytecdn\.cn|ibytedtos\.com|snssdk\.com)$/.test(hostname)
   }
 
   async function proxyStream(mediaUrl) {
@@ -441,30 +501,15 @@ export function apply(ctx, config = {}) {
    * serves only the composed client module, so these assets get their own
    * prefix route on the same Web server.
    */
-  /** HG2 图片 CDN 会把图片前 100 字节与固定串异或（image_crypto.dart）。 */
-  const IMAGE_XOR_KEY = Buffer.from('2019ysapp7527', 'latin1')
-  function xorImageHead(bytes) {
-    const out = Buffer.from(bytes)
-    for (let i = 0; i < Math.min(100, out.length); i += 1) out[i] ^= IMAGE_XOR_KEY[i % IMAGE_XOR_KEY.length]
-    return out
-  }
-  function sniffImage(bytes) {
-    if (bytes[0] === 0xff && bytes[1] === 0xd8) return 'image/jpeg'
-    if (bytes[0] === 0x89 && bytes[1] === 0x50) return 'image/png'
-    if (bytes.subarray(0, 4).toString('latin1') === 'RIFF' && bytes.subarray(8, 12).toString('latin1') === 'WEBP') return 'image/webp'
-    if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return 'image/gif'
-    return ''
-  }
-
   /**
-   * Serve one cover as JPEG. The CDN only publishes HEIC, which Chromium
-   * cannot decode; macOS ships `sips` for the conversion, and the result is
-   * cached on disk so each poster is converted once.
+   * Serve one cover as JPEG. The CDN publishes HEIC, which Chromium cannot
+   * decode, so anything that is not already a browser format is converted once
+   * and cached on disk.
    */
   async function serveCover(request, response, url) {
     const source = url.searchParams.get('u') ?? ''
     /** CDN hosts that may serve a poster. */
-    const coverHost = (hostname) => /(^|\.)(fqnovelpic\.com|byteimg\.com|pstatp\.com|snssdk\.com|bytecdn\.cn|lkkwip\.cn|6cc2n\.com|uszim\.com)$/.test(hostname)
+    const coverHost = (hostname) => /(^|\.)(fqnovelpic\.com|byteimg\.com|pstatp\.com|snssdk\.com|bytecdn\.cn|drleao\.cn|huangguoai\.com|huangguoai\.ai)$/.test(hostname)
     let target
     try {
       target = new URL(source)
@@ -485,57 +530,57 @@ export function apply(ctx, config = {}) {
       response.end(request.method === 'HEAD' ? undefined : bytes)
     }
     try {
-      return sendImage(await readFile(cached))
+      const hit = await readFile(cached)
+      // An earlier build could cache raw HEIC under .jpg; drop it and convert.
+      if (imageKind(hit)) return sendImage(hit, imageKind(hit))
+      await rm(cached, { force: true })
     } catch {
       // Not converted yet.
     }
+    // The CDN drops the odd request; one retry covers it.
     let upstream
-    try {
-      upstream = await fetch(target.href, { redirect: 'follow', signal: AbortSignal.timeout(20_000) })
-      // A redirect must not carry the allowlist somewhere else.
-      if (upstream.url && !coverHost(new URL(upstream.url).hostname)) {
-        upstream.body?.cancel().catch(() => {})
-        response.statusCode = 403
-        return response.end()
+    let bytes
+    for (let attempt = 0; attempt < 2 && !bytes; attempt += 1) {
+      try {
+        upstream = await fetch(target.href, { redirect: 'follow', signal: AbortSignal.timeout(20_000) })
+        // A redirect must not carry the allowlist somewhere else.
+        if (upstream.url && !coverHost(new URL(upstream.url).hostname)) {
+          upstream.body?.cancel().catch(() => {})
+          response.statusCode = 403
+          return response.end()
+        }
+        if (!upstream.ok) {
+          if (upstream.status < 500) break
+          continue
+        }
+        bytes = Buffer.from(await upstream.arrayBuffer())
+      } catch {
+        upstream = undefined
       }
-    } catch {
-      response.statusCode = 502
-      return response.end()
     }
-    if (!upstream.ok) {
-      response.statusCode = upstream.status
+    if (!bytes) {
+      response.statusCode = upstream && !upstream.ok ? upstream.status : 502
       return response.end()
     }
     const type = upstream.headers.get('content-type') ?? ''
-    let bytes = Buffer.from(await upstream.arrayBuffer())
-    // HG2 的图片 CDN 常把 JPEG 标成 application/octet-stream；先按魔数判断，
-    // 不像图片时再按前 100 字节异或还原一次。
-    let sniffed = sniffImage(bytes)
-    if (!sniffed) {
-      const decoded = xorImageHead(bytes)
-      const decodedType = sniffImage(decoded)
-      if (decodedType) {
-        bytes = decoded
-        sniffed = decodedType
-      }
+    if (/^image\/(jpeg|png|webp|gif|avif)/.test(type)) return sendImage(bytes, type)
+    // 备用片源（hghub）的封面是 AES-128-CBC 密文：解出来是普通 JPEG，
+    // 不需要 HEIC 转换，也不依赖 ffmpeg。
+    try {
+      const plain = decryptCover(bytes)
+      await mkdir(coverDir, { recursive: true, mode: 0o700 })
+      await writeFile(cached, plain)
+      return sendImage(plain, imageKind(plain) || 'image/jpeg')
+    } catch {
+      // 不是这份密文，继续走下面的 HEIC 转换。
     }
-    // Magic beats the header, and a mislabelled CDN response must not reach the
-    // browser as anything but the image type it actually is.
-    if (sniffed) return sendImage(bytes, sniffed)
-    const declared = /^image\/(jpeg|png|webp|gif|avif)/.exec(type)
-    if (declared) return sendImage(bytes, `image/${declared[1]}`)
-    // HEIC and everything else local ImageIO understands goes through sips.
+    // HEIC goes through the platform converter (sips on macOS, ffmpeg elsewhere).
     const rawPath = join(coverDir, `${key}.heic`)
     const outPath = `${key}.jpg`
     try {
       await mkdir(coverDir, { recursive: true, mode: 0o700 })
       await writeFile(rawPath, bytes)
-      // `sips` gets a bound like ffmpeg: a malformed image must not pin the
-      // conversion forever, and this route needs no login to reach.
-      await sips(
-        ['-s', 'format', 'jpeg', '-s', 'formatOptions', '70', '--resampleWidth', '240', rawPath, '--out', join(coverDir, outPath)],
-        { timeout: 15_000 },
-      )
+      await convertCover(rawPath, join(coverDir, outPath))
       const converted = await readFile(cached)
       pruneCovers()
       return sendImage(converted)
@@ -570,6 +615,66 @@ export function apply(ctx, config = {}) {
       response.end(request.method === 'HEAD' ? undefined : bytes)
     } catch {
       notFound()
+    }
+  }
+
+  /**
+   * Serve the standalone player window.
+   *
+   * The page is a fixed trio of files from the package, never a caller-supplied
+   * path, so this route cannot be turned into a file reader. It talks to the same
+   * `/api/hongguo` routes the Sidebar uses: the content key stays in the Host.
+   */
+  async function serveWindow(request, response, url) {
+    const entry = WINDOW_FILES.get(url.pathname.slice(WINDOW_PREFIX.length))
+    if (!entry) {
+      response.statusCode = 404
+      response.setHeader('content-type', 'text/plain; charset=utf-8')
+      return response.end('not found')
+    }
+    try {
+      const bytes = await readFile(new URL(entry[0], import.meta.url))
+      response.statusCode = 200
+      response.setHeader('content-type', entry[1])
+      // The window must pick up a changed page on its next open.
+      response.setHeader('cache-control', 'no-cache')
+      response.end(request.method === 'HEAD' ? undefined : bytes)
+    } catch (error) {
+      response.statusCode = 500
+      response.setHeader('content-type', 'text/plain; charset=utf-8')
+      response.end(String(error?.message ?? error))
+    }
+  }
+
+
+  /**
+   * Hand the player page to the user's own browser.
+   *
+   * The DSH shell is Electron and denies `window.open`, so the page cannot open
+   * this itself; the Host runs on the same machine as the browser and starts it.
+   * The URL is always one this plugin built, with nothing echoed from the caller.
+   */
+  async function launchBrowser(target) {
+    const options = { detached: true, stdio: 'ignore' }
+    if (process.platform === 'win32') {
+      // `start` is a cmd built-in; the empty argument is the window title slot.
+      spawn('cmd', ['/c', 'start', '', target], { ...options, windowsHide: true }).unref()
+      return
+    }
+    spawn(process.platform === 'darwin' ? 'open' : 'xdg-open', [target], options).unref()
+  }
+
+  /** Read a small JSON body; a missing or malformed one reads as an empty object. */
+  async function readJsonBody(request) {
+    let raw = ''
+    for await (const chunk of request) {
+      raw += chunk
+      if (raw.length > 4096) break
+    }
+    try {
+      return JSON.parse(raw || '{}') ?? {}
+    } catch {
+      return {}
     }
   }
 
@@ -658,22 +763,54 @@ export function apply(ctx, config = {}) {
     return refreshing
   }
 
-  // ---- 备用片源（hg2）------------------------------------------------------
-  // 第二个片源：APK 逆向出的 JSON 接口 + HLS（AES-128）。设备档案单独一份，
-  // 与红果的 openhongguo 档案互不影响。
-  /** 备用片源的匿名设备档案，与红果那份分开。 */
-  const hgProfilePath = join(dataDir, 'hg2-profile.json')
+  // ---- 备用片源（hghub）----------------------------------------------------
+  // 第二个片源：HGhub 那套「单一信封接口」+ HLS（AES-128）。不签名、不登录、
+  // 不建设备档案，所以接线比主片源薄得多。默认不用，`source: hghub` 才切过来。
   let hgClientPromise
+  /** 当前线路。默认第一条固定线路，失败时换镜像。 */
+  let hgLine = HGHUB_LINES[0].url
   function hgClient() {
-    hgClientPromise ??= (async () => {
-      const sdk = new Hg2Client({ profile: hgProfilePath, timeoutMs: 25_000 })
-      await sdk.ensureLogin()
-      return sdk
-    })().catch((error) => {
+    hgClientPromise ??= createHgClient({
+      base: hgLine,
+      timeoutMs: 25_000,
+      // 上游按窗口限流；批量拉列表时给一点间隔更稳。
+      minIntervalMs: 250,
+    }).catch((error) => {
       hgClientPromise = undefined
       throw error
     })
     return hgClientPromise
+  }
+
+  /** 线路不可达时换一条镜像重试一次。 */
+  async function withHgLine(fn) {
+    const sdk = await hgClient()
+    try {
+      return await fn(sdk)
+    } catch (error) {
+      if (!['NETWORK', 'HTTP', 'EDGE_ERROR', 'BAD_JSON'].includes(error?.code)) throw error
+      const next = await pickMirror(sdk.base).catch(() => undefined)
+      if (!next) throw error
+      logger.info?.(`[hghub] 线路 ${sdk.base} 失败，换 ${next}`)
+      sdk.setBase(next)
+      hgLine = next
+      return fn(sdk)
+    }
+  }
+
+  /** 从地址发布页挑一条可达的镜像（结果缓存五分钟）。 */
+  let hgMirrors
+  let hgMirrorsAt = 0
+  async function pickMirror(skip) {
+    if (!hgMirrors || Date.now() - hgMirrorsAt > 5 * 60_000) {
+      const found = await fetchMirrors({ limit: 8 }).catch(() => undefined)
+      hgMirrors = found?.items?.map((item) => item.url) ?? []
+      hgMirrorsAt = Date.now()
+    }
+    const candidates = hgMirrors.filter((value) => value !== skip).slice(0, 4)
+    if (candidates.length === 0) return undefined
+    const probed = await probeLines(candidates)
+    return probed.find((row) => row.ok)?.url
   }
 
   let hgGames = []
@@ -681,43 +818,45 @@ export function apply(ctx, config = {}) {
   let hgRefreshing
   const hgManifests = new Map()
 
-  /** 首页模块的前几页拼成一份列表；封面走 SDK 的图片 CDN。 */
-  async function gatherHg2() {
-    const sdk = await hgClient()
+  /**
+   * 首页聚合 + 第一页列表拼成一份目录：首页几栏质量最高（精选/最新/分类），
+   * 不够 48 部再用全站列表补齐。只发两三个请求。
+   */
+  async function gatherHghub() {
     const seen = new Map()
-    const modules = await sdk.modules()
-    for (const module of modules.slice(0, 6)) {
-      let page
-      try {
-        page = await sdk.discover({ moduleId: module.id, pageSize: 12 })
-      } catch {
-        continue
-      }
-      for (const item of page.items) {
-        if (!item?.id || seen.has(item.id)) continue
-        seen.set(item.id, {
-          id: item.id,
-          title: item.title,
-          description: '',
-          cover: sdk.coverURL(item.verticalCover || item.horizontalCover || ''),
-          episodes: item.totalEpisode,
-        })
-      }
-      if (seen.size >= 48) break
+    const push = (item) => {
+      if (!item?.id || seen.has(item.id) || seen.size >= 48) return
+      seen.set(item.id, {
+        id: item.id,
+        title: item.title,
+        description: item.description ?? '',
+        cover: item.cover,
+        episodes: item.episodes,
+        heat: item.hot,
+      })
     }
+    await withHgLine(async (sdk) => {
+      const home = await sdk.home()
+      for (const item of home.featured) push(item)
+      for (const item of home.latest) push(item)
+      for (const section of home.categories) for (const item of section.items) push(item)
+      if (seen.size >= 24) return
+      const feed = await sdk.feed({ page: 1, size: 40 })
+      for (const item of feed.items) push(item)
+    })
     return [...seen.values()].slice(0, 48)
   }
 
-  function refreshHg2() {
+  function refreshHghub() {
     hgRefreshing ??= (async () => {
       try {
-        const items = await gatherHg2()
+        const items = await gatherHghub()
         if (items.length > 0) {
           hgGames = items
           hgGamesAt = Date.now()
         }
       } catch (error) {
-        logger.warn?.(`[hg2] feed refresh failed: ${error?.message ?? error}`)
+        logger.warn?.(`[hghub] feed refresh failed: ${error?.message ?? error}`)
       } finally {
         hgRefreshing = undefined
       }
@@ -748,6 +887,13 @@ export function apply(ctx, config = {}) {
     }
 
     const path = url.pathname.slice(ROUTE_PREFIX.length) || '/'
+    /** 这条请求走哪个片源：显式 `?source=` 优先，否则看配置。 */
+    const usesHghub = (target) => {
+      const asked = target.searchParams.get('source')
+      if (asked === HGHUB_SOURCE) return true
+      if (asked === 'hongguo') return false
+      return readConfig().source === HGHUB_SOURCE
+    }
 
 
     if (path === '/media') {
@@ -851,9 +997,10 @@ export function apply(ctx, config = {}) {
       return
     }
 
-    if (path === '/hg2-manifest') {
-      const episodeId = safeId(url.searchParams.get('episode'))
-      if (!episodeId) return send(400, { ok: false, error: { message: 'bad episode' } })
+    if (path === '/hghub-manifest') {
+      const episodeId = url.searchParams.get('episode') ?? ''
+      const parsed = parseEpisodeId(episodeId)
+      if (!parsed) return send(400, { ok: false, error: { message: 'bad episode' } })
       const cached = hgManifests.get(episodeId)
       if (cached && Date.now() - cached.at < 45_000) {
         response.statusCode = 200
@@ -862,17 +1009,15 @@ export function apply(ctx, config = {}) {
         return response.end(cached.body)
       }
       try {
-        const sdk = await hgClient()
-        const info = await sdk.getEpisode(episodeId)
-        const videoUrl = info?.videoUrl || info?.previewVideoUrl
-        if (!videoUrl) throw Object.assign(new Error('这一集需要购买或会员才能播放'), { code: 'PAY_REQUIRED' })
-        const playlistURL = sdk.playbackURL(videoUrl)
-        const upstream = await fetch(playlistURL, {
-          headers: { 'user-agent': sdk.userAgent },
-          signal: AbortSignal.timeout(30_000),
+        const body = await withHgLine(async (sdk) => {
+          const info = await sdk.getPlay(parsed.videoId, parsed.ep)
+          const upstream = await fetch(info.videoUrl, {
+            headers: { 'user-agent': sdk.userAgent, referer: `${new URL(info.videoUrl).origin}/` },
+            signal: AbortSignal.timeout(30_000),
+          })
+          if (!upstream.ok) throw Object.assign(new Error(`播放列表 HTTP ${upstream.status}`), { status: 502, code: 'PLAYLIST_HTTP' })
+          return rewriteManifest(await upstream.text(), info.videoUrl)
         })
-        if (!upstream.ok) throw new Error(`播放列表 HTTP ${upstream.status}`)
-        const body = rewriteManifest(await upstream.text(), playlistURL)
         hgManifests.set(episodeId, { body, at: Date.now() })
         while (hgManifests.size > 32) hgManifests.delete(hgManifests.keys().next().value)
         response.statusCode = 200
@@ -888,7 +1033,13 @@ export function apply(ctx, config = {}) {
       return json(async () => {
         const current = readConfig()
         // No absolute filesystem path: this route needs no login.
-        return { autoPrompt: current.autoPrompt, panelWidth: current.panelWidth, searchTerms: current.searchTerms }
+        return {
+          autoPrompt: current.autoPrompt,
+          panelWidth: current.panelWidth,
+          source: current.source,
+          sources: ['hongguo', HGHUB_SOURCE],
+          searchTerms: current.searchTerms,
+        }
       })
     }
 
@@ -924,15 +1075,14 @@ export function apply(ctx, config = {}) {
     }
 
     if (path === '/feed') {
-      const source = url.searchParams.get('source') === 'hg2' ? 'hg2' : 'hongguo'
-      if (source === 'hg2') {
+      if (usesHghub(url)) {
         return json(async () => {
           if (hgGames.length > 0 && Date.now() - hgGamesAt < 15 * 60_000) return { items: hgGames }
           if (hgGames.length > 0) {
-            refreshHg2()
+            refreshHghub()
             return { items: hgGames }
           }
-          await refreshHg2()
+          await refreshHghub()
           if (hgGames.length === 0) throw Object.assign(new Error('暂时拿不到备用片源的剧集列表'), { code: 'UNAVAILABLE' })
           return { items: hgGames }
         })
@@ -952,37 +1102,38 @@ export function apply(ctx, config = {}) {
       })
     }
 
-    // Real search on the selected source, not a filter over the cached list.
+    // Real search on the service, not a filter over the cached list.
+    // One page is a handful of rows, so the cursor is passed both ways: the
+    // first call shows results at once, the client walks the rest.
     if (path === '/search') {
-      const source = url.searchParams.get('source') === 'hg2' ? 'hg2' : 'hongguo'
       const keyword = (url.searchParams.get('q') ?? '').trim().slice(0, 40)
+      const cursor = (url.searchParams.get('cursor') ?? '').trim().slice(0, 32)
       if (!keyword) return send(400, { ok: false, error: { message: 'empty query' } })
-      if (source === 'hg2') {
+      if (usesHghub(url)) {
         return json(async () => {
-          const sdk = await hgClient()
-          const page = await sdk.search(keyword, { pageSize: 24 })
-          const items = (page?.items ?? [])
-            .filter((item) => item?.id)
-            .map((item) => ({
+          const page = await withHgLine((sdk) => sdk.search(keyword, { page: 1, size: 24 }))
+          return {
+            items: (page?.items ?? []).map((item) => ({
               id: item.id,
               title: item.title,
-              description: '',
-              cover: sdk.coverURL(item.verticalCover || item.horizontalCover || ''),
-              episodes: item.totalEpisode,
-            }))
-          return { items }
+              description: item.description ?? '',
+              cover: item.cover,
+              episodes: item.episodes,
+            })),
+          }
         })
       }
       return json(async () => {
         const sdk = await client()
+        const search = () => sdk.search(keyword, cursor ? { cursor } : {})
         let page
         try {
-          page = await sdk.search(keyword, {})
+          page = await search()
         } catch (error) {
           if (error?.code !== 'ANONYMOUS_LIMITED') throw error
           // The anonymous device ran out; a fresh one answers the same query.
           await sdk.resetDevice()
-          page = await sdk.search(keyword, {})
+          page = await search()
         }
         const seen = new Map()
         for (const item of page?.items ?? []) mergeRows(seen, item)
@@ -1005,44 +1156,32 @@ export function apply(ctx, config = {}) {
             }
           }),
         )
-        return { items: rows }
+        return { items: rows, cursor: page?.cursor ?? '', hasMore: page?.has_more === true }
       })
     }
 
     if (path === '/series') {
-      const source = url.searchParams.get('source') === 'hg2' ? 'hg2' : 'hongguo'
       return json(async () => {
         const id = url.searchParams.get('id')
         if (!id) throw Object.assign(new Error('missing id'), { status: 400 })
-        if (source === 'hg2') {
-          const sdk = await hgClient()
-          const media = await sdk.getMedia(id).catch(() => undefined)
-          const rows = []
-          let pageNumber = 1
-          let hasMore = true
-          while (hasMore && pageNumber <= 5) {
-            const page = await sdk.listEpisodes(id, { pageNumber, pageSize: 200 })
-            rows.push(...(page.items ?? []))
-            hasMore = Boolean(page.hasMore) && page.items.length > 0
-            pageNumber += 1
-          }
-          const episodes = rows.sort((a, b) => (a.episodeNumber ?? 0) - (b.episodeNumber ?? 0))
+        if (usesHghub(url)) {
+          // 详情里直接带分集列表，一次请求就够。
+          const detail = await withHgLine((sdk) => sdk.getVideo(id))
+          const known = hgGames.find((row) => String(row.id) === String(id))
           return {
             series: {
-              id,
-              title: media?.title,
-              description: media?.summary,
-              cover: sdk.coverURL(media?.verticalCover || media?.horizontalCover || ''),
-              episodes: media?.totalEpisode ?? episodes.length,
+              id: detail.id,
+              title: detail.title,
+              description: detail.description,
+              cover: detail.cover || known?.cover,
+              episodes: detail.episodes,
             },
-            episodes: episodes.map((episode) => ({
-              id: episode.id,
-              number: episode.episodeNumber,
-              title: episode.name,
-              cover: episode.cover ? sdk.coverURL(episode.cover) : undefined,
-              // 免费集有 videoUrl；付费集有时带一段试看（previewVideoUrl），也可以播
-              playable: Boolean(episode.videoUrl || episode.previewVideoUrl),
-              preview: !episode.videoUrl && Boolean(episode.previewVideoUrl),
+            episodes: detail.episodeList.map((ep) => ({
+              // 本片源没有单集 id，用 `{videoId}_{ep}` 拼一个稳定的复合 id。
+              id: makeEpisodeId(detail.id, ep.number),
+              number: ep.number,
+              title: ep.title,
+              playable: ep.playable,
             })),
           }
         }
@@ -1063,28 +1202,27 @@ export function apply(ctx, config = {}) {
     }
 
     if (path === '/play') {
-      const source = url.searchParams.get('source') === 'hg2' ? 'hg2' : 'hongguo'
       return json(async () => {
         const episodeId = url.searchParams.get('episode')
         if (!episodeId) throw Object.assign(new Error('missing episode'), { status: 400 })
         const seriesId = url.searchParams.get('series') ?? undefined
-        if (source === 'hg2') {
-          const sdk = await hgClient()
-          const info = await sdk.getEpisode(episodeId)
-          if (!info?.videoUrl && !info?.previewVideoUrl) {
-            throw Object.assign(new Error('这一集需要购买或会员才能播放'), { code: 'PAY_REQUIRED', status: 402 })
-          }
+        if (usesHghub(url)) {
+          const parsed = parseEpisodeId(episodeId)
+          if (!parsed) throw Object.assign(new Error('bad episode'), { status: 400 })
+          const info = await withHgLine((sdk) => sdk.getPlay(parsed.videoId, parsed.ep))
           return {
             episodeId,
             seriesId,
-            duration: info.videoUrl ? info.playTime : info.previewSeconds || info.playTime,
-            preview: !info.videoUrl,
+            duration: info.duration,
+            preview: false,
+            // 标准 HLS + AES-128：key 由 hls.js 自己向 CDN 取，Host 只改写清单，
+            // 所以既不需要 ffmpeg，也不占 media/ 缓存。
             protected: false,
             sources: [
               {
                 definition: 'HLS',
                 kind: 'hlsjs',
-                url: `${ROUTE_PREFIX}/hg2-manifest?episode=${encodeURIComponent(episodeId)}`,
+                url: `${ROUTE_PREFIX}/hghub-manifest?episode=${encodeURIComponent(episodeId)}`,
               },
             ],
           }
@@ -1135,6 +1273,32 @@ export function apply(ctx, config = {}) {
       })
     }
 
+    // Hand the player to the user's default browser: the shell denies window.open.
+    if (path === '/open' && request.method === 'POST') {
+      // A browser started here belongs to this machine. For a remote client that
+      // would open the window where nobody is looking, so the page keeps the
+      // job in that case and opens the window itself.
+      const remote = String(request.socket?.remoteAddress ?? '')
+      if (!/^(::1|::ffff:127\.0\.0\.1|127\.0\.0\.1)$/.test(remote)) {
+        return send(409, { ok: false, error: { message: 'remote client: open the window from the page' } })
+      }
+      return json(async () => {
+        const body = await readJsonBody(request)
+        const params = new URLSearchParams()
+        for (const key of ['series', 'episode']) {
+          const value = body?.[key]
+          if (typeof value === 'string' && WINDOW_ID.test(value)) params.set(key, value)
+        }
+        const at = Number(body?.at)
+        if (Number.isFinite(at) && at > 0) params.set('at', String(Math.floor(at)))
+        const proto = String(request.headers['x-forwarded-proto'] ?? 'http').split(',')[0].trim()
+        const host = String(request.headers.host ?? '127.0.0.1:64866')
+        const target = `${proto === 'https' ? 'https' : 'http'}://${host}${WINDOW_PREFIX}${params.toString() ? `?${params.toString()}` : ''}`
+        await launchBrowser(target)
+        return { opened: target }
+      })
+    }
+
     response.statusCode = 404
     response.end('{"ok":false,"error":{"message":"not found"}}')
   }
@@ -1142,6 +1306,8 @@ export function apply(ctx, config = {}) {
   // Build the list once at startup so the first page view does not wait for a
   // cold anonymous device.
   refreshFeed()
+  // 备用片源只在被设成默认时才预热（它没有冷设备的问题，第一次切换自己会拉）。
+  ready.then(() => { if (readConfig().source === HGHUB_SOURCE) refreshHghub() }).catch(() => {})
 
   // The Web server is optional in non-web profiles; everything else still works.
   ctx.inject(['webServer'], (web) => {
@@ -1189,6 +1355,9 @@ export function apply(ctx, config = {}) {
     const cover = guard((request, response) =>
       serveCover(request, response, new URL(request.url, `http://${request.headers.host ?? 'localhost'}`)),
     )
+    const windowed = guard((request, response) =>
+      serveWindow(request, response, new URL(request.url, `http://${request.headers.host ?? 'localhost'}`)),
+    )
     // One effect owns every route, so unloading the plugin frees them together.
     const dispose = ctx.effect(
       () => {
@@ -1196,6 +1365,9 @@ export function apply(ctx, config = {}) {
           web.webServer.register({ kind: 'prefix', path: ROUTE_PREFIX, handler: data }),
           web.webServer.register({ kind: 'prefix', path: VENDOR_PREFIX, handler: vendor }),
           web.webServer.register({ kind: 'prefix', path: COVER_PREFIX, handler: cover }),
+          // Before the API prefix in intent, though the router prefers the
+          // longest match: `/api/hongguo/window` is its own document.
+          web.webServer.register({ kind: 'prefix', path: WINDOW_PREFIX, handler: windowed }),
         ]
         return () => stops.forEach((stop) => stop())
       },

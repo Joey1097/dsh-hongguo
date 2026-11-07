@@ -1,0 +1,345 @@
+/* The standalone player window: its own document, so its own palette. */
+:root {
+  --hg-bg: #fbfaf9;
+  --hg-fg: #1c1b1a;
+  --hg-muted: #6b6661;
+  --hg-line: #e5e1dc;
+  --hg-card: #ffffff;
+  --hg-accent: #c61d4b;
+  --hg-radius: 10px;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --hg-bg: #17161a;
+    --hg-fg: #f2efec;
+    --hg-muted: #a09a94;
+    --hg-line: #2c2a30;
+    --hg-card: #201e24;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--hg-bg);
+  color: var(--hg-fg);
+  font: 13px/1.45 system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+}
+
+.hg-app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  min-height: 0;
+}
+
+/* ---- header ---- */
+.hg-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--hg-line);
+  flex: none;
+}
+
+.hg-title {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hg-sub {
+  font-size: 11px;
+  color: var(--hg-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.hg-btn {
+  appearance: none;
+  border: 1px solid var(--hg-line);
+  background: var(--hg-card);
+  color: inherit;
+  border-radius: var(--hg-radius);
+  padding: 5px 10px;
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.hg-btn:hover {
+  border-color: var(--hg-accent);
+}
+
+.hg-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.hg-btn.primary {
+  background: var(--hg-accent);
+  border-color: var(--hg-accent);
+  color: #fff;
+}
+
+.hg-search {
+  flex: 0 1 190px;
+  min-width: 96px;
+  border: 1px solid var(--hg-line);
+  background: var(--hg-card);
+  color: inherit;
+  border-radius: var(--hg-radius);
+  padding: 5px 9px;
+  font: inherit;
+}
+
+.hg-search:focus {
+  outline: none;
+  border-color: var(--hg-accent);
+}
+
+/* ---- body ---- */
+.hg-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+.hg-muted {
+  color: var(--hg-muted);
+  padding: 18px 4px;
+}
+
+.hg-error {
+  border: 1px solid var(--hg-line);
+  border-radius: var(--hg-radius);
+  padding: 12px;
+  margin-bottom: 12px;
+  color: var(--hg-muted);
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+/* ---- list ---- */
+.hg-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+@media (max-width: 720px) {
+  .hg-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 460px) {
+  .hg-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.hg-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+}
+
+.hg-cover {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 3 / 4;
+  border-radius: var(--hg-radius);
+  overflow: hidden;
+  background: var(--hg-card);
+  border: 1px solid var(--hg-line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--hg-muted);
+}
+
+.hg-cover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.hg-card:hover .hg-cover {
+  border-color: var(--hg-accent);
+}
+
+.hg-card-title {
+  font-size: 12px;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* ---- player ---- */
+.hg-stage {
+  position: relative;
+  width: 100%;
+  background: #000;
+  border-radius: var(--hg-radius);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.hg-stage video {
+  width: 100%;
+  height: 100%;
+  display: block;
+  background: #000;
+}
+
+.hg-note {
+  color: var(--hg-muted);
+  font-size: 12px;
+  padding: 8px 2px;
+}
+
+/* The on-picture volume level: shown for a moment after a wheel turn. */
+.hg-vol {
+  position: absolute;
+  left: 50%;
+  top: 14%;
+  transform: translateX(-50%);
+  padding: 7px 13px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.66);
+  color: #fff;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.18s ease;
+}
+
+.hg-vol.show {
+  opacity: 1;
+}
+
+/* Speed, picture-in-picture and the volume readout, under the picture. */
+.hg-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0 2px;
+  flex-wrap: wrap;
+}
+
+.hg-select {
+  appearance: none;
+  border: 1px solid var(--hg-line);
+  background: var(--hg-card);
+  color: inherit;
+  border-radius: var(--hg-radius);
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.hg-pills {
+  display: flex;
+  gap: 6px;
+  padding: 8px 0;
+  flex-wrap: wrap;
+}
+
+.hg-pill {
+  border: 1px solid var(--hg-line);
+  background: var(--hg-card);
+  color: inherit;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.hg-pill[aria-pressed='true'] {
+  border-color: var(--hg-accent);
+  color: var(--hg-accent);
+}
+
+.hg-episodes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 0 4px;
+}
+
+.hg-ep {
+  min-width: 34px;
+  border: 1px solid var(--hg-line);
+  background: var(--hg-card);
+  color: inherit;
+  border-radius: 8px;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+
+.hg-ep[aria-current='true'] {
+  border-color: var(--hg-accent);
+  background: var(--hg-accent);
+  color: #fff;
+}
+
+.hg-chunks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--hg-line);
+}
+
+.hg-chunk[aria-selected='true'] {
+  border-color: var(--hg-accent);
+  color: var(--hg-accent);
+}
+
+.hg-desc {
+  color: var(--hg-muted);
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 10px 2px 0;
+  white-space: pre-wrap;
+}
+
+.hg-foot {
+  color: var(--hg-muted);
+  font-size: 11px;
+  padding: 12px 2px 0;
+  border-top: 1px solid var(--hg-line);
+  margin-top: 12px;
+}
